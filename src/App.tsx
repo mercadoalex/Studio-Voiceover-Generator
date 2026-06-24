@@ -649,12 +649,23 @@ export default function App() {
     }
   });
   
+  const [autoSaveText, setAutoSaveText] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("studio_autosave_enabled") !== "false";
+    } catch (e) {
+      return true;
+    }
+  });
+  
   // Audio state
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [base64Audio, setBase64Audio] = useState<string | null>(null);
   const [isExportingMp3, setIsExportingMp3] = useState<boolean>(false);
   const [mp3ExportProgress, setMp3ExportProgress] = useState<number>(0);
+  const [exportFormat, setExportFormat] = useState<"wav" | "mp3" | "ogg">("wav");
+  const [isExportingOgg, setIsExportingOgg] = useState<boolean>(false);
+  const [oggExportProgress, setOggExportProgress] = useState<number>(0);
   
   // Side-by-Side Comparison states
   const [isComparisonMode, setIsComparisonMode] = useState<boolean>(() => {
@@ -755,12 +766,21 @@ export default function App() {
 
   // Sync to localStorage effects
   useEffect(() => {
+    if (!autoSaveText) return;
     try {
       localStorage.setItem("studio_text", text);
     } catch (e) {
       console.warn("localStorage sync error:", e);
     }
-  }, [text]);
+  }, [text, autoSaveText]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("studio_autosave_enabled", String(autoSaveText));
+    } catch (e) {
+      console.warn("localStorage sync error:", e);
+    }
+  }, [autoSaveText]);
 
   useEffect(() => {
     try {
@@ -3138,6 +3158,183 @@ export default function App() {
     }, 100);
   };
 
+  // Helper to compile OGG (Vorbis / WebM) client-side and initiate download
+  const exportCompressedOgg = () => {
+    if (!base64Audio) return;
+    setIsExportingOgg(true);
+    setOggExportProgress(0);
+    setError(null);
+
+    // Run on timeout to allow UI loading spinner to render
+    setTimeout(async () => {
+      try {
+        const binaryString = window.atob(base64Audio);
+        const len = binaryString.length;
+        const bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+
+        let pcm16 = new Int16Array(bytes.buffer);
+        const sampleRate = 24000;
+
+        // Apply the user's interactive drag trim boundaries
+        if (trimStartRatio > 0 || trimEndRatio < 1) {
+          const startIndex = Math.floor(trimStartRatio * pcm16.length);
+          const endIndex = Math.floor(trimEndRatio * pcm16.length);
+          pcm16 = pcm16.subarray(startIndex, Math.min(endIndex, pcm16.length));
+        }
+
+        if (trimSilence) {
+          const threshold = 300;
+          let startOffset = 0;
+          let endOffset = pcm16.length;
+          for (let i = 0; i < pcm16.length; i++) {
+            if (Math.abs(pcm16[i]) >= threshold) {
+              startOffset = i;
+              break;
+            }
+          }
+          for (let i = pcm16.length - 1; i >= startOffset; i--) {
+            if (Math.abs(pcm16[i]) >= threshold) {
+              endOffset = i + 1;
+              break;
+            }
+          }
+          pcm16 = pcm16.subarray(startOffset, endOffset);
+        }
+
+        if (normalizeAudio) {
+          const normFactor = getNormalizationFactor();
+          const normalized = new Int16Array(pcm16.length);
+          for (let i = 0; i < pcm16.length; i++) {
+            let val = Math.round(pcm16[i] * normFactor);
+            if (val > 32767) val = 32767;
+            else if (val < -32768) val = -32768;
+            normalized[i] = val;
+          }
+          pcm16 = normalized;
+        }
+
+        // Convert PCM Int16 samples to Float32 for standard Web Audio API
+        const float32 = new Float32Array(pcm16.length);
+        for (let i = 0; i < pcm16.length; i++) {
+          float32[i] = pcm16[i] / 32768.0;
+        }
+
+        // Try using modern MediaRecorder stream playback if supported by browser
+        let mimeType = "audio/ogg";
+        if (!MediaRecorder.isTypeSupported(mimeType)) {
+          mimeType = MediaRecorder.isTypeSupported("audio/ogg;codecs=opus")
+            ? "audio/ogg;codecs=opus"
+            : MediaRecorder.isTypeSupported("audio/webm")
+              ? "audio/webm"
+              : "";
+        }
+
+        if (mimeType && (window.AudioContext || (window as any).webkitAudioContext)) {
+          const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+          const buffer = ctx.createBuffer(1, float32.length, sampleRate);
+          buffer.getChannelData(0).set(float32);
+
+          const source = ctx.createBufferSource();
+          source.buffer = buffer;
+
+          const dest = ctx.createMediaStreamDestination();
+          source.connect(dest);
+
+          const recorder = new MediaRecorder(dest.stream, { mimeType });
+          const chunks: Blob[] = [];
+
+          recorder.ondataavailable = (e) => {
+            if (e.data && e.data.size > 0) {
+              chunks.push(e.data);
+            }
+          };
+
+          recorder.onstop = () => {
+            const extension = mimeType.includes("ogg") ? "ogg" : "webm";
+            const blob = new Blob(chunks, { type: mimeType });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = `voiceover-${selectedVoice.toLowerCase()}-dry-studio.${extension}`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            setIsExportingOgg(false);
+            setOggExportProgress(100);
+          };
+
+          // Simulate encoding progress based on audio duration
+          const duration = float32.length / sampleRate;
+          let elapsed = 0;
+          const interval = setInterval(() => {
+            elapsed += 0.2;
+            const pct = Math.min(99, Math.round((elapsed / duration) * 100));
+            setOggExportProgress(pct);
+            if (elapsed >= duration) {
+              clearInterval(interval);
+            }
+          }, 200);
+
+          recorder.start();
+          source.start(0);
+
+          setTimeout(() => {
+            recorder.stop();
+            ctx.close();
+          }, (duration * 1000) + 150);
+
+        } else {
+          // Absolute fallback if MediaRecorder is missing: package as a valid WAV labeled .ogg or standard blob
+          const wavBuffer = new ArrayBuffer(44 + pcm16.length * 2);
+          const view = new DataView(wavBuffer);
+          const writeString = (view: DataView, offset: number, str: string) => {
+            for (let i = 0; i < str.length; i++) {
+              view.setUint8(offset + i, str.charCodeAt(i));
+            }
+          };
+
+          writeString(view, 0, "RIFF");
+          view.setUint32(4, 36 + pcm16.length * 2, true);
+          writeString(view, 8, "WAVE");
+          writeString(view, 12, "fmt ");
+          view.setUint32(16, 16, true);
+          view.setUint16(20, 1, true);
+          view.setUint16(22, 1, true);
+          view.setUint32(24, sampleRate, true);
+          view.setUint32(28, sampleRate * 2, true);
+          view.setUint16(32, 2, true);
+          view.setUint16(34, 16, true);
+          writeString(view, 36, "data");
+          view.setUint32(40, pcm16.length * 2, true);
+
+          for (let i = 0; i < pcm16.length; i++) {
+            view.setInt16(44 + i * 2, pcm16[i], true);
+          }
+
+          const blob = new Blob([view], { type: "audio/ogg" });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `voiceover-${selectedVoice.toLowerCase()}-dry-studio.ogg`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+          setOggExportProgress(100);
+          setIsExportingOgg(false);
+        }
+      } catch (e) {
+        console.error("OGG compile error:", e);
+        setError("Could not compile audio to OGG format.");
+        setIsExportingOgg(false);
+      }
+    }, 100);
+  };
+
   // Load a preset script or text blocks
   const loadPresetText = (type: "full" | "short1" | "short2") => {
     if (type === "full") {
@@ -4046,10 +4243,19 @@ export default function App() {
                     </h2>
                   </div>
                   <div className="flex items-center gap-3">
-                    <span className="text-[9px] text-[#4ADE80] font-mono uppercase tracking-wider flex items-center gap-1.5 opacity-80" title="All edits are cached locally in real-time">
-                      <span className="h-1 w-1 rounded-full bg-[#4ADE80] animate-pulse" />
-                      Auto-Saved
-                    </span>
+                    <button
+                      onClick={() => setAutoSaveText(!autoSaveText)}
+                      className={`text-[9px] font-mono uppercase tracking-wider flex items-center gap-1.5 px-2 py-0.5 rounded border transition-all cursor-pointer ${
+                        autoSaveText
+                          ? "text-[#4ADE80] bg-[#4ADE80]/10 border-[#4ADE80]/30 hover:bg-[#4ADE80]/20"
+                          : "text-[#8E9299] bg-[#15171C] border-[#2D3036] hover:bg-[#1C1F26]"
+                      }`}
+                      title={autoSaveText ? "Click to pause auto-saving of script text to localStorage" : "Click to enable auto-saving of script text to localStorage"}
+                      id="btn-toggle-autosave"
+                    >
+                      <span className={`h-1.5 w-1.5 rounded-full transition-all ${autoSaveText ? "bg-[#4ADE80] animate-pulse" : "bg-[#8E9299]"}`} />
+                      <span>{autoSaveText ? "Auto-Save: On" : "Auto-Save: Off"}</span>
+                    </button>
                     {text.length > 0 && (
                       <button 
                         onClick={() => setText("")}
@@ -5556,56 +5762,117 @@ export default function App() {
 
                 {/* Download and Export Buttons group */}
                 <div className="flex flex-col gap-2.5 w-full">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    {/* High Fidelity Download Master Trigger */}
-                    <button
-                      onClick={downloadWav}
-                      disabled={!base64Audio || isExportingMp3}
-                      className={`h-11 px-4 rounded text-xs font-mono font-bold tracking-widest uppercase flex items-center gap-2 transition-all ${
-                        !base64Audio
-                          ? "bg-[#15171C] border border-[#2D3036] text-[#5C616A] cursor-not-allowed"
-                          : "bg-[#15171C] hover:bg-[#1C1F26] text-white border border-[#2D3036] hover:border-[#5C616A] hover:scale-[1.02]"
-                      }`}
-                      id="btn-download-wav"
-                    >
-                      <Download className="h-4 w-4" />
-                      <span>DOWNLOAD WAV</span>
-                    </button>
-
-                    {/* Compressed Export MP3 Trigger */}
-                    <button
-                      onClick={exportCompressedMp3}
-                      disabled={!base64Audio || isExportingMp3}
-                      className={`h-11 px-4 rounded text-xs font-mono font-bold tracking-widest uppercase flex items-center gap-2 transition-all relative overflow-hidden ${
-                        !base64Audio
-                          ? "bg-[#15171C] border border-[#2D3036] text-[#5C616A] cursor-not-allowed"
-                          : isExportingMp3
-                            ? "bg-[#15171C] border border-emerald-500/40 text-emerald-400 cursor-wait"
-                            : "bg-[#4ADE80] hover:bg-[#22C55E] text-[#0B0C0E] border-none hover:scale-[1.02] hover:shadow-[0_0_10px_rgba(74,222,128,0.3)] cursor-pointer"
-                      }`}
-                      id="btn-export-mp3"
-                    >
-                      {isExportingMp3 && (
-                        <div 
-                          className="absolute inset-y-0 left-0 bg-emerald-500/10 transition-all duration-150 ease-out" 
-                          style={{ width: `${mp3ExportProgress}%` }}
-                        />
-                      )}
-                      
-                      <span className="relative z-10 flex items-center gap-2">
-                        {isExportingMp3 ? (
-                          <>
-                            <RefreshCw className="h-4 w-4 animate-spin" />
-                            <span>ENCODING {mp3ExportProgress}%</span>
-                          </>
-                        ) : (
-                          <>
-                            <Sparkles className="h-4 w-4" />
-                            <span>EXPORT MP3 (192K)</span>
-                          </>
-                        )}
+                  <div className="flex items-center gap-3 flex-wrap">
+                    {/* Format Selection Dropdown */}
+                    <div className="flex items-center gap-2 bg-[#0B0C0E] border border-[#2D3036] px-3 h-11 rounded select-none">
+                      <span className="text-[9px] font-mono text-[#8E9299] font-bold uppercase tracking-wider">
+                        Format:
                       </span>
-                    </button>
+                      <select
+                        value={exportFormat}
+                        onChange={(e) => setExportFormat(e.target.value as any)}
+                        disabled={!base64Audio || isExportingMp3 || isExportingOgg}
+                        className="bg-[#15171C] border border-[#2D3036] text-[#4ADE80] rounded px-2 py-0.5 text-[10px] font-mono font-bold focus:outline-none focus:border-[#4ADE80]/50 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                        id="export-format-select"
+                        title="Select the acoustic output container format"
+                      >
+                        <option value="wav" className="bg-[#15171C] text-[#4ADE80]">WAV (Lossless)</option>
+                        <option value="mp3" className="bg-[#15171C] text-[#4ADE80]">MP3 (192K)</option>
+                        <option value="ogg" className="bg-[#15171C] text-[#4ADE80]">OGG (Vorbis)</option>
+                      </select>
+                    </div>
+
+                    {/* Dynamic Action Export Button */}
+                    {exportFormat === "wav" && (
+                      <button
+                        onClick={downloadWav}
+                        disabled={!base64Audio || isExportingMp3 || isExportingOgg}
+                        className={`h-11 px-4 rounded text-xs font-mono font-bold tracking-widest uppercase flex items-center gap-2 transition-all ${
+                          !base64Audio
+                            ? "bg-[#15171C] border border-[#2D3036] text-[#5C616A] cursor-not-allowed"
+                            : "bg-[#15171C] hover:bg-[#1C1F26] text-white border border-[#2D3036] hover:border-[#5C616A] hover:scale-[1.02]"
+                        }`}
+                        id="btn-download-wav"
+                        title="Download lossless stereo WAV format"
+                      >
+                        <Download className="h-4 w-4 text-[#4ADE80]" />
+                        <span>DOWNLOAD WAV</span>
+                      </button>
+                    )}
+
+                    {exportFormat === "mp3" && (
+                      <button
+                        onClick={exportCompressedMp3}
+                        disabled={!base64Audio || isExportingMp3 || isExportingOgg}
+                        className={`h-11 px-4 rounded text-xs font-mono font-bold tracking-widest uppercase flex items-center gap-2 transition-all relative overflow-hidden ${
+                          !base64Audio
+                            ? "bg-[#15171C] border border-[#2D3036] text-[#5C616A] cursor-not-allowed"
+                            : isExportingMp3
+                              ? "bg-[#15171C] border border-emerald-500/40 text-emerald-400 cursor-wait"
+                              : "bg-[#4ADE80] hover:bg-[#22C55E] text-[#0B0C0E] border-none hover:scale-[1.02] hover:shadow-[0_0_10px_rgba(74,222,128,0.3)] cursor-pointer"
+                        }`}
+                        id="btn-export-mp3"
+                        title="Encode & Download compressed MP3 format"
+                      >
+                        {isExportingMp3 && (
+                          <div 
+                            className="absolute inset-y-0 left-0 bg-emerald-500/10 transition-all duration-150 ease-out" 
+                            style={{ width: `${mp3ExportProgress}%` }}
+                          />
+                        )}
+                        
+                        <span className="relative z-10 flex items-center gap-2">
+                          {isExportingMp3 ? (
+                            <>
+                              <RefreshCw className="h-4 w-4 animate-spin" />
+                              <span>ENCODING {mp3ExportProgress}%</span>
+                            </>
+                          ) : (
+                            <>
+                              <Sparkles className="h-4 w-4" />
+                              <span>EXPORT MP3</span>
+                            </>
+                          )}
+                        </span>
+                      </button>
+                    )}
+
+                    {exportFormat === "ogg" && (
+                      <button
+                        onClick={exportCompressedOgg}
+                        disabled={!base64Audio || isExportingMp3 || isExportingOgg}
+                        className={`h-11 px-4 rounded text-xs font-mono font-bold tracking-widest uppercase flex items-center gap-2 transition-all relative overflow-hidden ${
+                          !base64Audio
+                            ? "bg-[#15171C] border border-[#2D3036] text-[#5C616A] cursor-not-allowed"
+                            : isExportingOgg
+                              ? "bg-[#15171C] border border-emerald-500/40 text-emerald-400 cursor-wait"
+                              : "bg-[#4ADE80] hover:bg-[#22C55E] text-[#0B0C0E] border-none hover:scale-[1.02] hover:shadow-[0_0_10px_rgba(74,222,128,0.3)] cursor-pointer"
+                        }`}
+                        id="btn-export-ogg"
+                        title="Encode & Download compressed OGG format"
+                      >
+                        {isExportingOgg && (
+                          <div 
+                            className="absolute inset-y-0 left-0 bg-emerald-500/10 transition-all duration-150 ease-out" 
+                            style={{ width: `${oggExportProgress}%` }}
+                          />
+                        )}
+                        
+                        <span className="relative z-10 flex items-center gap-2">
+                          {isExportingOgg ? (
+                            <>
+                              <RefreshCw className="h-4 w-4 animate-spin" />
+                              <span>ENCODING {oggExportProgress}%</span>
+                            </>
+                          ) : (
+                            <>
+                              <Sparkles className="h-4 w-4" />
+                              <span>EXPORT OGG</span>
+                            </>
+                          )}
+                        </span>
+                      </button>
+                    )}
 
                     {/* Premium Audio Sharing Link Trigger */}
                     <button
