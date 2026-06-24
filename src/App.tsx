@@ -32,12 +32,14 @@ import {
   Link,
   Undo2,
   Pencil,
-  Eye
+  Eye,
+  Layers
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import JSZip from "jszip";
 // @ts-ignore
 import lamejs from "lamejs";
+import { BatchStatusPieChart } from "./components/BatchStatusPieChart";
 
 // Miniature responsive waveform component for side-by-side active visual comparison
 const MiniWaveformCompare = ({ 
@@ -1292,6 +1294,14 @@ export default function App() {
   const [editingBulkVoice, setEditingBulkVoice] = useState<string>("");
   const [editingBulkTone, setEditingBulkTone] = useState<string>("");
 
+  const [bulkFilenamePrefix, setBulkFilenamePrefix] = useState<string>(() => {
+    try {
+      return localStorage.getItem("studio_bulk_filename_prefix") || "";
+    } catch (e) {
+      return "";
+    }
+  });
+
   // Wrap setBulkItems to automatically record history for manual user changes
   const updateBulkItemsWithUndo = (newItems: BulkItem[] | ((prev: BulkItem[]) => BulkItem[])) => {
     setBulkItems(prev => {
@@ -1329,6 +1339,12 @@ export default function App() {
       localStorage.setItem("studio_bulk_format", bulkFormat);
     } catch (e) {}
   }, [bulkFormat]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("studio_bulk_filename_prefix", bulkFilenamePrefix);
+    } catch (e) {}
+  }, [bulkFilenamePrefix]);
 
   // Save bulk items (excluding AudioBuffers which are non-serializable)
   useEffect(() => {
@@ -1590,8 +1606,39 @@ export default function App() {
     }, 80);
   };
 
+  // Helper to compile a highly-customizable bulk filename based on user-defined prefixes or dynamic patterns
+  const formatBulkFilename = (prefixOrPattern: string, index: number, voiceName: string, text: string, extension: string = "wav") => {
+    const cleanSnippet = text.slice(0, 20).toLowerCase().replace(/[^a-z0-9]+/g, "-") || "audio";
+    const lowercaseVoice = voiceName.toLowerCase();
+    const paddedIndex = String(index + 1).padStart(2, "0");
+
+    if (!prefixOrPattern) {
+      // Default naming convention
+      return `${paddedIndex}-${lowercaseVoice}-${cleanSnippet}.${extension}`;
+    }
+
+    // If it contains placeholder variables, do dynamic substitution
+    if (prefixOrPattern.includes("{index}") || prefixOrPattern.includes("{voice}") || prefixOrPattern.includes("{text}")) {
+      let result = prefixOrPattern
+        .replace(/{index}/g, paddedIndex)
+        .replace(/{voice}/g, lowercaseVoice)
+        .replace(/{text}/g, cleanSnippet);
+      
+      // Sanitize the resulting filename to make it safe
+      result = result.replace(/[^a-zA-Z0-9_\-\.\{\}]+/g, "-");
+      if (!result.endsWith(`.${extension}`)) {
+        result += `.${extension}`;
+      }
+      return result;
+    }
+
+    // Otherwise, treat as a classic prefix and prepend it
+    const safePrefix = prefixOrPattern.replace(/[^a-zA-Z0-9_\-]+/g, "-");
+    return `${safePrefix}${paddedIndex}-${lowercaseVoice}-${cleanSnippet}.${extension}`;
+  };
+
   // Convert base64 PCM back to a downloadable WAV format (supports bulk downloads)
-  const handleDownloadWavForItem = (pcmDataB64: string, voiceName: string, textSnippet: string) => {
+  const handleDownloadWavForItem = (pcmDataB64: string, voiceName: string, textSnippet: string, idx?: number) => {
     const binaryString = window.atob(pcmDataB64);
     const len = binaryString.length;
     const bytes = new Uint8Array(len);
@@ -1652,8 +1699,8 @@ export default function App() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    const cleanSnippet = textSnippet.slice(0, 25).toLowerCase().replace(/[^a-z0-9]+/g, "-");
-    a.download = `voiceover-${voiceName.toLowerCase()}-${cleanSnippet || "audio"}.wav`;
+    const resolvedIdx = typeof idx === "number" ? idx : 0;
+    a.download = formatBulkFilename(bulkFilenamePrefix, resolvedIdx, voiceName, textSnippet, "wav");
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -1725,8 +1772,7 @@ export default function App() {
         view.setInt16(44 + i * 2, pcm16[i], true);
       }
 
-      const cleanSnippet = item.text.slice(0, 20).toLowerCase().replace(/[^a-z0-9]+/g, "-");
-      const filename = `${String(idx + 1).padStart(2, "0")}-${item.voiceName.toLowerCase()}-${cleanSnippet || "audio"}.wav`;
+      const filename = formatBulkFilename(bulkFilenamePrefix, idx, item.voiceName, item.text, "wav");
       
       zip.file(filename, view.buffer);
     }
@@ -4531,6 +4577,194 @@ export default function App() {
             ) : (
               // Bulk Batch Script Manager UI
               <div className="space-y-4">
+                {bulkItems.length > 0 && (() => {
+                  const completedCount = bulkItems.filter(i => i.status === "completed").length;
+                  const failedCount = bulkItems.filter(i => i.status === "failed").length;
+                  const generatingCount = bulkItems.filter(i => i.status === "generating").length;
+                  const idleCount = bulkItems.filter(i => i.status === "idle").length;
+                  
+                  let currentGeneratingFraction = 0;
+                  const generatingItem = bulkItems.find(i => i.status === "generating");
+                  if (generatingItem && generatingItem.progressText) {
+                    const match = generatingItem.progressText.match(/(\d+)%/);
+                    if (match) {
+                      currentGeneratingFraction = parseInt(match[1], 10) / 100;
+                    }
+                  }
+                  
+                  const globalProgressPct = Math.min(100, Math.round(((completedCount + failedCount + currentGeneratingFraction) / bulkItems.length) * 100));
+
+                  // Batch Analytics calculations
+                  const completedDuration = bulkItems.filter(i => i.status === "completed").reduce((sum, i) => sum + (i.duration || 0), 0);
+                  const totalDuration = bulkItems.reduce((sum, i) => {
+                    if (i.status === "completed" && i.duration) {
+                      return sum + i.duration;
+                    }
+                    const words = i.text ? i.text.split(/\s+/).filter(Boolean).length : 0;
+                    const estDur = Math.max(1.0, words * 0.45);
+                    return sum + estDur;
+                  }, 0);
+
+                  const totalChars = bulkItems.reduce((sum, i) => sum + (i.text ? i.text.length : 0), 0);
+                  const totalWords = bulkItems.reduce((sum, i) => {
+                    const words = i.text ? i.text.split(/\s+/).filter(Boolean).length : 0;
+                    return sum + words;
+                  }, 0);
+                  const totalTokens = Math.ceil(totalChars / 4);
+
+                  return (
+                    <>
+                      <div className="bg-[#0B0C0E]/90 border border-[#2D3036]/90 p-4 rounded font-mono space-y-3 relative overflow-hidden shadow-lg" id="global-batch-progress-container">
+                        {/* Subtle background glow when generating */}
+                        {isGeneratingBulk && (
+                          <div className="absolute inset-0 bg-[#4ADE80]/5 animate-pulse pointer-events-none" />
+                        )}
+                        
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <div className="relative">
+                              <Layers className="h-4 w-4 text-[#4ADE80]" />
+                              {isGeneratingBulk && (
+                                <span className="absolute -top-1 -right-1 flex h-1.5 w-1.5">
+                                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#4ADE80] opacity-75"></span>
+                                  <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-[#4ADE80]"></span>
+                                </span>
+                              )}
+                            </div>
+                            <div>
+                              <span className="text-[10px] text-white uppercase tracking-wider font-bold block">
+                                Global Batch Progress
+                              </span>
+                              <span className="text-[9px] text-[#8E9299]">
+                                Overall status of the active voice synthesis queue
+                              </span>
+                            </div>
+                          </div>
+                          <div className="text-right">
+                            <span className="text-sm font-bold font-mono text-[#4ADE80] tracking-tight">
+                              {globalProgressPct}%
+                            </span>
+                            <span className="text-[8px] text-[#5C616A] block uppercase font-bold">
+                              {completedCount + failedCount} / {bulkItems.length} Processed
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* Bar track */}
+                        <div className="relative w-full bg-[#15171C] h-3 rounded-full overflow-hidden border border-[#2D3036] shadow-inner">
+                          {/* Completed portion (emerald) */}
+                          <div 
+                            className="bg-gradient-to-r from-emerald-500 to-[#4ADE80] h-full transition-all duration-300 rounded-full" 
+                            style={{ width: `${globalProgressPct}%` }}
+                          />
+                          {/* Striped animation during generation */}
+                          {isGeneratingBulk && (
+                            <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/5 to-transparent animate-[shimmer_2s_infinite] pointer-events-none" />
+                          )}
+                        </div>
+
+                        {/* Status metrics grid */}
+                        <div className="grid grid-cols-4 gap-2 pt-1 text-[9px] font-mono">
+                          <div className="bg-[#15171C]/50 p-1.5 rounded border border-[#2D3036]/40 text-center">
+                            <span className="text-[#8E9299] block mb-0.5">Idle</span>
+                            <span className="text-white font-bold">{idleCount}</span>
+                          </div>
+                          <div className="bg-[#15171C]/50 p-1.5 rounded border border-[#2D3036]/40 text-center">
+                            <span className="text-[#4ADE80] block mb-0.5">Active</span>
+                            <span className="text-[#4ADE80] font-bold animate-pulse">{generatingCount}</span>
+                          </div>
+                          <div className="bg-[#15171C]/50 p-1.5 rounded border border-[#2D3036]/40 text-center">
+                            <span className="text-emerald-400 block mb-0.5">Completed</span>
+                            <span className="text-emerald-400 font-bold">{completedCount}</span>
+                          </div>
+                          <div className="bg-[#15171C]/50 p-1.5 rounded border border-[#2D3036]/40 text-center">
+                            <span className="text-[#FF4444] block mb-0.5">Failed</span>
+                            <span className="text-[#FF4444] font-bold">{failedCount}</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Batch Analytics panel */}
+                      <div className="bg-[#0B0C0E]/90 border border-[#2D3036]/90 p-4 rounded font-mono space-y-3 shadow-lg" id="batch-analytics-panel">
+                        <div className="flex items-center gap-2">
+                          <Zap className="h-4 w-4 text-[#4ADE80]" />
+                          <div>
+                            <span className="text-[10px] text-white uppercase tracking-wider font-bold block">
+                              Batch Analytics & Metrics
+                            </span>
+                            <span className="text-[9px] text-[#8E9299]">
+                              Live size, queue processing, and cost usage estimates for the active batch
+                            </span>
+                          </div>
+                        </div>
+                        
+                        <div className="grid grid-cols-1 lg:grid-cols-4 gap-4 items-stretch">
+                          {/* Metrics Grid */}
+                          <div className="lg:col-span-3 grid grid-cols-1 sm:grid-cols-3 gap-3">
+                            {/* Metric 1: Total Duration */}
+                            <div className="bg-[#15171C]/60 p-3 rounded border border-[#2D3036]/50 flex items-center gap-3">
+                              <div className="p-2 bg-emerald-500/10 rounded border border-emerald-500/20">
+                                <Timer className="h-4 w-4 text-emerald-400" />
+                              </div>
+                              <div>
+                                <span className="text-[9px] text-[#8E9299] uppercase font-bold block">Est. Total Duration</span>
+                                <span className="text-sm font-bold text-white font-mono">
+                                  {totalDuration.toFixed(1)}s
+                                </span>
+                                <span className="text-[8px] text-[#5C616A] block">
+                                  ({completedDuration.toFixed(1)}s synthesized)
+                                </span>
+                              </div>
+                            </div>
+
+                            {/* Metric 2: Tokens / Characters */}
+                            <div className="bg-[#15171C]/60 p-3 rounded border border-[#2D3036]/50 flex items-center gap-3">
+                              <div className="p-2 bg-[#4ADE80]/10 rounded border border-[#4ADE80]/20">
+                                <FileText className="h-4 w-4 text-[#4ADE80]" />
+                              </div>
+                              <div>
+                                <span className="text-[9px] text-[#8E9299] uppercase font-bold block">Size & Cost</span>
+                                <span className="text-sm font-bold text-white font-mono">
+                                  {totalChars.toLocaleString()} <span className="text-[10px] text-[#8E9299] font-normal">chars</span>
+                                </span>
+                                <span className="text-[8px] text-[#5C616A] block">
+                                  {totalWords.toLocaleString()} words (~{totalTokens.toLocaleString()} tokens)
+                                </span>
+                              </div>
+                            </div>
+
+                            {/* Metric 3: Queue Status */}
+                            <div className="bg-[#15171C]/60 p-3 rounded border border-[#2D3036]/50 flex items-center gap-3">
+                              <div className="p-2 bg-purple-500/10 rounded border border-purple-500/20">
+                                <Layers className="h-4 w-4 text-purple-400" />
+                              </div>
+                              <div>
+                                <span className="text-[9px] text-[#8E9299] uppercase font-bold block">Queue Status</span>
+                                <span className="text-sm font-bold text-white font-mono">
+                                  {completedCount} / {bulkItems.length} <span className="text-[10px] text-[#8E9299] font-normal">Complete</span>
+                                </span>
+                                <span className="text-[8px] text-[#5C616A] block">
+                                  {idleCount} pending • {failedCount} failed
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+
+                          {/* Pie Chart Column */}
+                          <div className="lg:col-span-1 bg-[#15171C]/30 p-2.5 rounded border border-[#2D3036]/50 flex flex-col justify-center">
+                            <BatchStatusPieChart
+                              completed={completedCount}
+                              generating={generatingCount}
+                              idle={idleCount}
+                              failed={failedCount}
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    </>
+                  );
+                })()}
+
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-[#0B0C0E]/80 p-3.5 rounded border border-[#2D3036]/80 font-mono">
                   <div className="space-y-1">
                     <span className="text-[10px] text-[#4ADE80] font-mono uppercase tracking-wider block font-bold">
@@ -4567,6 +4801,51 @@ export default function App() {
                     >
                       CSV Format
                     </button>
+                  </div>
+                </div>
+
+                {/* Filename Customization Pattern Option */}
+                <div className="bg-[#0B0C0E]/80 p-3.5 rounded border border-[#2D3036]/80 font-mono space-y-3">
+                  <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+                    <div className="space-y-1">
+                      <span className="text-[10px] text-[#4ADE80] uppercase tracking-wider block font-bold">
+                        Batch Filename Customization
+                      </span>
+                      <span className="text-[9px] text-[#8E9299] block">
+                        Define a custom prefix or dynamic pattern (e.g. <code className="text-[#4ADE80] font-semibold">Project_01_</code> or <code className="text-purple-400 font-semibold">Audio_{"{voice}"}_Part{"{index}"}</code>)
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="text"
+                        value={bulkFilenamePrefix}
+                        onChange={(e) => setBulkFilenamePrefix(e.target.value)}
+                        placeholder="e.g., Project_01_ or Audio_{voice}_{index}"
+                        className="bg-[#15171C] border border-[#2D3036] rounded px-3 py-1.5 text-xs text-white placeholder-[#5C616A] focus:outline-none focus:border-[#4ADE80]/50 font-mono w-64 md:w-80"
+                        title="Enter filename pattern or custom prefix for the generated files"
+                        id="input-bulk-filename-prefix"
+                      />
+                      {bulkFilenamePrefix && (
+                        <button
+                          onClick={() => setBulkFilenamePrefix("")}
+                          className="text-[9px] px-2 py-1.5 rounded bg-neutral-800 hover:bg-neutral-700 text-[#FF4444] border border-[#FF4444]/20 uppercase font-mono font-bold transition-colors cursor-pointer"
+                          title="Reset to default naming structure"
+                        >
+                          Clear
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* High fidelity Live Preview of the formatted filename */}
+                  <div className="text-[9px] text-[#8E9299] flex flex-wrap items-center gap-2 border-t border-[#2D3036]/30 pt-2 font-mono">
+                    <span className="uppercase text-[#5C616A] font-bold">Output Filename Preview:</span>
+                    <span className="bg-[#15171C] px-2 py-0.5 rounded border border-[#2D3036]/40 text-[#4ADE80] font-bold select-all tracking-wide">
+                      {formatBulkFilename(bulkFilenamePrefix, 0, "Charon", "System online")}
+                    </span>
+                    <span className="text-[8px] text-[#5C616A] italic">
+                      (Variables: <code className="text-gray-400">{"{index}"}</code>, <code className="text-gray-400">{"{voice}"}</code>, <code className="text-gray-400">{"{text}"}</code>)
+                    </span>
                   </div>
                 </div>
 
@@ -5087,95 +5366,107 @@ export default function App() {
                         );
                       }
 
-                      return filtered.map(({ item, originalIdx }) => {
-                        const isCurrent = isGeneratingBulk && bulkProgressIndex === originalIdx;
-                        const isEditing = editingBulkItemId === item.id;
+                      return (
+                        <AnimatePresence initial={false} mode="popLayout">
+                          {filtered.map(({ item, originalIdx }) => {
+                            const isCurrent = isGeneratingBulk && bulkProgressIndex === originalIdx;
+                            const isEditing = editingBulkItemId === item.id;
 
-                        if (isEditing) {
-                          return (
-                            <div 
-                              key={item.id} 
-                              className="p-3.5 bg-blue-950/20 border-l-2 border-blue-500 space-y-3 font-mono text-xs transition-colors"
-                            >
-                              <div className="flex items-center justify-between text-[9px] text-[#8E9299] uppercase font-bold">
-                                <span>Editing Item [{String(originalIdx + 1).padStart(2, "0")}]</span>
-                                <span className="text-blue-400 font-bold">Inline Editor</span>
-                              </div>
-                              <div className="space-y-1.5">
-                                <label className="text-[8px] text-[#5C616A] uppercase font-bold block">Script Text</label>
-                                <textarea
-                                  value={editingBulkText}
-                                  onChange={(e) => setEditingBulkText(e.target.value)}
-                                  className="w-full bg-[#0B0C0E] border border-[#2D3036] rounded p-2 text-xs font-sans text-white focus:outline-none focus:border-blue-500/60 leading-relaxed resize-y h-16"
-                                />
-                              </div>
-                              <div className="grid grid-cols-2 gap-2">
-                                <div className="space-y-1">
-                                  <label className="text-[8px] text-[#5C616A] uppercase font-bold block">Voice Model</label>
-                                  <select
-                                    value={editingBulkVoice}
-                                    onChange={(e) => setEditingBulkVoice(e.target.value)}
-                                    className="w-full bg-[#0B0C0E] border border-[#2D3036] rounded p-1.5 text-[10px] text-slate-300 font-mono focus:outline-none focus:border-blue-500/60 cursor-pointer"
-                                  >
-                                    {VOICES.map(v => (
-                                      <option key={v.name} value={v.name}>{v.name}</option>
-                                    ))}
-                                  </select>
-                                </div>
-                                <div className="space-y-1">
-                                  <label className="text-[8px] text-[#5C616A] uppercase font-bold block">Tone Description</label>
-                                  <input
-                                    type="text"
-                                    value={editingBulkTone}
-                                    onChange={(e) => setEditingBulkTone(e.target.value)}
-                                    className="w-full bg-[#0B0C0E] border border-[#2D3036] rounded p-1.5 text-[10px] text-slate-300 font-mono focus:outline-none focus:border-blue-500/60"
-                                  />
-                                </div>
-                              </div>
-                              <div className="flex items-center justify-end gap-1.5 pt-1">
-                                <button
-                                  type="button"
-                                  onClick={() => setEditingBulkItemId(null)}
-                                  className="px-2.5 py-1 bg-neutral-800 hover:bg-neutral-700 text-[#8E9299] text-[9px] rounded font-bold uppercase transition-all cursor-pointer"
+                            if (isEditing) {
+                              return (
+                                <motion.div 
+                                  key={item.id} 
+                                  layout
+                                  initial={{ opacity: 0, y: 10 }}
+                                  animate={{ opacity: 1, y: 0 }}
+                                  exit={{ opacity: 0, scale: 0.95 }}
+                                  transition={{ duration: 0.2 }}
+                                  className="p-3.5 bg-blue-950/20 border-l-2 border-blue-500 space-y-3 font-mono text-xs transition-colors"
                                 >
-                                  Cancel
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    const didChange = item.text !== editingBulkText || item.voiceName !== editingBulkVoice || item.toneDescription !== editingBulkTone;
-                                    updateBulkItemsWithUndo(prev => prev.map(p => p.id === item.id ? {
-                                      ...p,
-                                      text: editingBulkText,
-                                      voiceName: editingBulkVoice,
-                                      toneDescription: editingBulkTone,
-                                      status: didChange ? "idle" : p.status,
-                                      base64Audio: didChange ? undefined : p.base64Audio,
-                                      audioBuffer: didChange ? undefined : p.audioBuffer,
-                                      duration: didChange ? undefined : p.duration,
-                                    } : p));
-                                    setEditingBulkItemId(null);
-                                  }}
-                                  className="px-3 py-1 bg-blue-600 hover:bg-blue-500 text-white text-[9px] rounded font-bold uppercase transition-all cursor-pointer"
-                                >
-                                  Save Change
-                                </button>
-                              </div>
-                            </div>
-                          );
-                        }
+                                  <div className="flex items-center justify-between text-[9px] text-[#8E9299] uppercase font-bold">
+                                    <span>Editing Item [{String(originalIdx + 1).padStart(2, "0")}]</span>
+                                    <span className="text-blue-400 font-bold">Inline Editor</span>
+                                  </div>
+                                  <div className="space-y-1.5">
+                                    <label className="text-[8px] text-[#5C616A] uppercase font-bold block">Script Text</label>
+                                    <textarea
+                                      value={editingBulkText}
+                                      onChange={(e) => setEditingBulkText(e.target.value)}
+                                      className="w-full bg-[#0B0C0E] border border-[#2D3036] rounded p-2 text-xs font-sans text-white focus:outline-none focus:border-blue-500/60 leading-relaxed resize-y h-16"
+                                    />
+                                  </div>
+                                  <div className="grid grid-cols-2 gap-2">
+                                    <div className="space-y-1">
+                                      <label className="text-[8px] text-[#5C616A] uppercase font-bold block">Voice Model</label>
+                                      <select
+                                        value={editingBulkVoice}
+                                        onChange={(e) => setEditingBulkVoice(e.target.value)}
+                                        className="w-full bg-[#0B0C0E] border border-[#2D3036] rounded p-1.5 text-[10px] text-slate-300 font-mono focus:outline-none focus:border-blue-500/60 cursor-pointer"
+                                      >
+                                        {VOICES.map(v => (
+                                          <option key={v.name} value={v.name}>{v.name}</option>
+                                        ))}
+                                      </select>
+                                    </div>
+                                    <div className="space-y-1">
+                                      <label className="text-[8px] text-[#5C616A] uppercase font-bold block">Tone Description</label>
+                                      <input
+                                        type="text"
+                                        value={editingBulkTone}
+                                        onChange={(e) => setEditingBulkTone(e.target.value)}
+                                        className="w-full bg-[#0B0C0E] border border-[#2D3036] rounded p-1.5 text-[10px] text-slate-300 font-mono focus:outline-none focus:border-blue-500/60"
+                                      />
+                                    </div>
+                                  </div>
+                                  <div className="flex items-center justify-end gap-1.5 pt-1">
+                                    <button
+                                      type="button"
+                                      onClick={() => setEditingBulkItemId(null)}
+                                      className="px-2.5 py-1 bg-neutral-800 hover:bg-neutral-700 text-[#8E9299] text-[9px] rounded font-bold uppercase transition-all cursor-pointer"
+                                    >
+                                      Cancel
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        const didChange = item.text !== editingBulkText || item.voiceName !== editingBulkVoice || item.toneDescription !== editingBulkTone;
+                                        updateBulkItemsWithUndo(prev => prev.map(p => p.id === item.id ? {
+                                          ...p,
+                                          text: editingBulkText,
+                                          voiceName: editingBulkVoice,
+                                          toneDescription: editingBulkTone,
+                                          status: didChange ? "idle" : p.status,
+                                          base64Audio: didChange ? undefined : p.base64Audio,
+                                          audioBuffer: didChange ? undefined : p.audioBuffer,
+                                          duration: didChange ? undefined : p.duration,
+                                        } : p));
+                                        setEditingBulkItemId(null);
+                                      }}
+                                      className="px-3 py-1 bg-blue-600 hover:bg-blue-500 text-white text-[9px] rounded font-bold uppercase transition-all cursor-pointer"
+                                    >
+                                      Save Change
+                                    </button>
+                                  </div>
+                                </motion.div>
+                              );
+                            }
 
-                        return (
-                          <div 
-                            key={item.id} 
-                            className={`p-3 flex flex-col md:flex-row md:items-center justify-between gap-3 transition-colors ${
-                              isCurrent 
-                                ? "bg-[#4ADE80]/5" 
-                                : item.status === "completed" 
-                                  ? "bg-emerald-950/5 hover:bg-emerald-950/10" 
-                                  : "hover:bg-[#15171C]/40"
-                            }`}
-                          >
+                            return (
+                              <motion.div 
+                                key={item.id} 
+                                layout
+                                initial={{ opacity: 0, y: 12 }}
+                                animate={{ opacity: 1, y: 0 }}
+                                exit={{ opacity: 0, scale: 0.95, y: -10 }}
+                                transition={{ duration: 0.2 }}
+                                className={`p-3 flex flex-col md:flex-row md:items-center justify-between gap-3 transition-colors ${
+                                  isCurrent 
+                                    ? "bg-[#4ADE80]/5" 
+                                    : item.status === "completed" 
+                                      ? "bg-emerald-950/5 hover:bg-emerald-950/10" 
+                                      : "hover:bg-[#15171C]/40"
+                                }`}
+                              >
                             {/* Left part: text and tags */}
                             <div className="space-y-1.5 flex-grow">
                               <div className="flex items-center gap-2 flex-wrap">
@@ -5243,7 +5534,7 @@ export default function App() {
                                       <Play className="h-3.5 w-3.5 fill-current" />
                                     </button>
                                     <button
-                                      onClick={() => handleDownloadWavForItem(item.base64Audio!, item.voiceName, item.text)}
+                                      onClick={() => handleDownloadWavForItem(item.base64Audio!, item.voiceName, item.text, originalIdx)}
                                       className="p-1.5 bg-neutral-800 hover:bg-neutral-700 text-white border border-[#2D3036] rounded transition-colors cursor-pointer"
                                       title="Download item WAV"
                                     >
@@ -5272,10 +5563,12 @@ export default function App() {
                                 </button>
                               </div>
                             </div>
-                          </div>
+                          </motion.div>
                         );
-                      });
-                    })()}
+                      })}
+                    </AnimatePresence>
+                  );
+                })()}
                   </div>
                 )}
               </div>
