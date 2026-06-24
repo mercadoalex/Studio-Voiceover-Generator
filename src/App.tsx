@@ -27,7 +27,12 @@ import {
   Save,
   Music,
   Zap,
-  Timer
+  Timer,
+  Share2,
+  Link,
+  Undo2,
+  Pencil,
+  Eye
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import JSZip from "jszip";
@@ -117,6 +122,7 @@ interface BulkItem {
   base64Audio?: string;
   audioBuffer?: AudioBuffer | null;
   duration?: number;
+  progressText?: string;
 }
 
 // Interface for Recent Voice Configurations
@@ -139,6 +145,47 @@ interface SyncAnalysisSegment {
   deviation: number;
   status: "fast" | "slow" | "normal";
 }
+
+// Interactive / real peaks-based micro-waveform for Bulk Item preview
+const BulkItemWaveform = React.memo(({ buffer }: { buffer: AudioBuffer | null | undefined }) => {
+  const peaks = React.useMemo(() => {
+    if (!buffer) return Array(24).fill(0.15);
+    try {
+      const channelData = buffer.getChannelData(0);
+      const step = Math.floor(channelData.length / 24) || 1;
+      const result: number[] = [];
+      for (let i = 0; i < 24; i++) {
+        let max = 0;
+        const start = i * step;
+        const end = Math.min(start + step, channelData.length);
+        for (let j = start; j < end; j++) {
+          const val = Math.abs(channelData[j]);
+          if (val > max) max = val;
+        }
+        result.push(max);
+      }
+      const maxPeak = Math.max(...result);
+      if (maxPeak > 0) {
+        return result.map(p => (p / maxPeak) * 0.85 + 0.15); // min 15% height
+      }
+      return Array(24).fill(0.15);
+    } catch {
+      return Array(24).fill(0.15);
+    }
+  }, [buffer]);
+
+  return (
+    <div className="w-[100px] h-6 flex items-end justify-between gap-[2px] px-1.5 py-[3px] bg-[#090A0C] border border-[#2D3036]/50 rounded group/wave hover:border-[#4ADE80]/30 transition-all select-none">
+      {peaks.map((p, i) => (
+        <div
+          key={i}
+          className="flex-grow bg-emerald-500/30 group-hover/wave:bg-[#4ADE80]/70 rounded-[1px] transition-all"
+          style={{ height: `${p * 100}%` }}
+        />
+      ))}
+    </div>
+  );
+});
 
 // Robust CSV Parser
 const parseCSV = (csvText: string): { text: string; voiceName?: string; toneDescription?: string }[] => {
@@ -607,6 +654,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [base64Audio, setBase64Audio] = useState<string | null>(null);
   const [isExportingMp3, setIsExportingMp3] = useState<boolean>(false);
+  const [mp3ExportProgress, setMp3ExportProgress] = useState<number>(0);
   
   // Side-by-Side Comparison states
   const [isComparisonMode, setIsComparisonMode] = useState<boolean>(() => {
@@ -761,6 +809,38 @@ export default function App() {
   const [playbackSpeed, setPlaybackSpeed] = useState<number>(1.0);
   const [pitchShift, setPitchShift] = useState<number>(0);
   const [normalizeAudio, setNormalizeAudio] = useState<boolean>(false);
+  const [fadeInDuration, setFadeInDuration] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem("studio_fade_in_duration");
+      return saved ? parseFloat(saved) : 0.05;
+    } catch {
+      return 0.05;
+    }
+  });
+  const [fadeOutDuration, setFadeOutDuration] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem("studio_fade_out_duration");
+      return saved ? parseFloat(saved) : 0.05;
+    } catch {
+      return 0.05;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("studio_fade_in_duration", String(fadeInDuration));
+    } catch (e) {
+      console.warn("localStorage sync error:", e);
+    }
+  }, [fadeInDuration]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("studio_fade_out_duration", String(fadeOutDuration));
+    } catch (e) {
+      console.warn("localStorage sync error:", e);
+    }
+  }, [fadeOutDuration]);
   const [trimSilence, setTrimSilence] = useState<boolean>(false);
   const [silenceReport, setSilenceReport] = useState<{
     leadingMs: number;
@@ -770,6 +850,15 @@ export default function App() {
   } | null>(null);
   const [audioPeakDb, setAudioPeakDb] = useState<number>(-Infinity);
   const [audioDuration, setAudioDuration] = useState<number>(0);
+  const [trimStartRatio, setTrimStartRatio] = useState<number>(0);
+  const [trimEndRatio, setTrimEndRatio] = useState<number>(1);
+  const [activeDragHandle, setActiveDragHandle] = useState<"start" | "end" | null>(null);
+
+  useEffect(() => {
+    setTrimStartRatio(0);
+    setTrimEndRatio(1);
+  }, [base64Audio]);
+
   const [currentTime, setCurrentTime] = useState<number>(0);
   const [playbackProgress, setPlaybackProgress] = useState<number>(0);
   const [waveformZoom, setWaveformZoom] = useState<number>(1);
@@ -779,12 +868,110 @@ export default function App() {
   const [syncSegments, setSyncSegments] = useState<SyncAnalysisSegment[]>([]);
   const [isSynced, setIsSynced] = useState<boolean>(false);
   const [averageWpm, setAverageWpm] = useState<number>(0);
+  const [targetWpm, setTargetWpm] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem("studio_target_wpm");
+      return saved ? parseInt(saved) : 150;
+    } catch (e) {
+      return 150;
+    }
+  });
+
+  const handleTargetWpmChange = (val: number) => {
+    const clamped = Math.max(1, Math.min(500, val));
+    setTargetWpm(clamped);
+    try {
+      localStorage.setItem("studio_target_wpm", clamped.toString());
+    } catch (e) {}
+  };
 
   // Reset sync on text or audio change to prevent stale alignments
   useEffect(() => {
     setIsSynced(false);
     setSyncSegments([]);
   }, [text, base64Audio]);
+
+  // Audio Sharing Feature States
+  const [isSharing, setIsSharing] = useState<boolean>(false);
+  const [shareUrl, setShareUrl] = useState<string | null>(null);
+  const [copySuccess, setCopySuccess] = useState<boolean>(false);
+  const [shareError, setShareError] = useState<string | null>(null);
+  const [isLoadingShared, setIsLoadingShared] = useState<boolean>(false);
+  const [sharedLoadError, setSharedLoadError] = useState<string | null>(null);
+
+  // Load shared audio on mount if ?share=ID exists in URL
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const shareId = params.get("share");
+    if (shareId) {
+      const fetchShared = async () => {
+        setIsLoadingShared(true);
+        setSharedLoadError(null);
+        try {
+          const res = await fetch(`/api/share/${shareId}`);
+          if (!res.ok) {
+            throw new Error("Shared voiceover not found or has expired.");
+          }
+          const data = await res.json();
+          if (data.base64Audio) {
+            setText(data.text || "");
+            setSelectedVoice(data.voiceName || "Charon");
+            setBase64Audio(data.base64Audio);
+            // Allow components to initialize, then load the audio buffer
+            setTimeout(() => {
+              loadAudioBuffer(data.base64Audio).catch(console.error);
+            }, 100);
+          }
+        } catch (err: any) {
+          console.error("Error loading shared audio:", err);
+          setSharedLoadError(err.message || "Failed to load shared voiceover.");
+        } finally {
+          setIsLoadingShared(false);
+        }
+      };
+      fetchShared();
+    }
+  }, []);
+
+  // Generate and copy a shareable temporary link
+  const handleShareAudio = async () => {
+    if (!base64Audio) return;
+    setIsSharing(true);
+    setShareError(null);
+    setShareUrl(null);
+    setCopySuccess(false);
+
+    try {
+      const res = await fetch("/api/share", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          base64Audio,
+          text,
+          voiceName: selectedVoice
+        })
+      });
+
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.error || "Failed to generate share link.");
+      }
+
+      const { id } = await res.json();
+      const generatedUrl = `${window.location.origin}${window.location.pathname}?share=${id}`;
+      setShareUrl(generatedUrl);
+
+      // Copy url to system clipboard
+      await navigator.clipboard.writeText(generatedUrl);
+      setCopySuccess(true);
+      setTimeout(() => setCopySuccess(false), 3000);
+    } catch (err: any) {
+      console.error("Error sharing audio:", err);
+      setShareError(err.message || "An error occurred while creating the share link.");
+    } finally {
+      setIsSharing(false);
+    }
+  };
 
   // Premium Features 3 (DSP Rack) & 4 (Ambient soundscapes) States
   const [dspBassBoost, setDspBassBoost] = useState<number>(() => {
@@ -834,8 +1021,15 @@ export default function App() {
       return saved ? parseInt(saved) : 25;
     } catch (e) { return 25; }
   });
+  const [autoDuckingEnabled, setAutoDuckingEnabled] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem("studio_auto_ducking");
+      return saved === "true";
+    } catch (e) { return false; }
+  });
 
   const activeAmbientNodesRef = useRef<any[]>([]);
+  const ambientGainNodeRef = useRef<GainNode | null>(null);
 
   // Sync premium features to localStorage
   useEffect(() => {
@@ -848,10 +1042,22 @@ export default function App() {
       localStorage.setItem("studio_dsp_reverb_feedback", String(dspReverbFeedback));
       localStorage.setItem("studio_ambient_track", ambientTrack);
       localStorage.setItem("studio_ambient_volume", String(ambientVolume));
+      localStorage.setItem("studio_auto_ducking", String(autoDuckingEnabled));
     } catch (e) {
       console.warn("localStorage sync error:", e);
     }
-  }, [dspBassBoost, dspTrebleBoost, dspCompressorEnabled, dspReverbMix, dspReverbDelayTime, dspReverbFeedback, ambientTrack, ambientVolume]);
+  }, [dspBassBoost, dspTrebleBoost, dspCompressorEnabled, dspReverbMix, dspReverbDelayTime, dspReverbFeedback, ambientTrack, ambientVolume, autoDuckingEnabled]);
+
+  // Adjust ambient mixer volume in real-time if the slider or ducking is toggled
+  useEffect(() => {
+    if (ambientGainNodeRef.current && audioCtxRef.current) {
+      const ctxTime = audioCtxRef.current.currentTime;
+      if (!autoDuckingEnabled) {
+        const fullGain = ambientVolume / 100;
+        ambientGainNodeRef.current.gain.setTargetAtTime(fullGain, ctxTime, 0.1);
+      }
+    }
+  }, [ambientVolume, autoDuckingEnabled]);
 
   // Web Audio Nodes references
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -1055,6 +1261,35 @@ export default function App() {
   const [bulkProgressIndex, setBulkProgressIndex] = useState<number>(0);
   const [bulkUploadError, setBulkUploadError] = useState<string | null>(null);
   const [bulkIsDragging, setBulkIsDragging] = useState<boolean>(false);
+  const [bulkFilter, setBulkFilter] = useState<"all" | "idle" | "generating" | "completed" | "failed">("all");
+  const [showBulkTimelinePreview, setShowBulkTimelinePreview] = useState<boolean>(false);
+  const [hoveredSegmentIndex, setHoveredSegmentIndex] = useState<number | null>(null);
+
+  // Undo & Editing States for Bulk Batch Manager
+  const [bulkUndoStack, setBulkUndoStack] = useState<BulkItem[][]>([]);
+  const [editingBulkItemId, setEditingBulkItemId] = useState<string | null>(null);
+  const [editingBulkText, setEditingBulkText] = useState<string>("");
+  const [editingBulkVoice, setEditingBulkVoice] = useState<string>("");
+  const [editingBulkTone, setEditingBulkTone] = useState<string>("");
+
+  // Wrap setBulkItems to automatically record history for manual user changes
+  const updateBulkItemsWithUndo = (newItems: BulkItem[] | ((prev: BulkItem[]) => BulkItem[])) => {
+    setBulkItems(prev => {
+      const next = typeof newItems === "function" ? newItems(prev) : newItems;
+      setBulkUndoStack(undoPrev => {
+        // Limit to 25 items to prevent excessive memory usage
+        return [...undoPrev.slice(-24), prev];
+      });
+      return next;
+    });
+  };
+
+  const handleUndoBulkAction = () => {
+    if (bulkUndoStack.length === 0) return;
+    const previousState = bulkUndoStack[bulkUndoStack.length - 1];
+    setBulkUndoStack(prev => prev.slice(0, -1));
+    setBulkItems(previousState);
+  };
 
   // Sync state to localStorage
   useEffect(() => {
@@ -1129,9 +1364,13 @@ export default function App() {
   }, []);
 
   // Parse action from bulk input
-  const handleParseBulkScripts = (rawText: string, format: "lines" | "csv") => {
+  const handleParseBulkScripts = (rawText: string, format: "lines" | "csv", isManualAction = false) => {
     if (!rawText.trim()) {
-      setBulkItems([]);
+      if (isManualAction) {
+        updateBulkItemsWithUndo([]);
+      } else {
+        setBulkItems([]);
+      }
       return;
     }
 
@@ -1144,7 +1383,11 @@ export default function App() {
         toneDescription: toneDescription,
         status: "idle",
       }));
-      setBulkItems(parsed);
+      if (isManualAction) {
+        updateBulkItemsWithUndo(parsed);
+      } else {
+        setBulkItems(parsed);
+      }
       setBulkUploadError(null);
     } else {
       try {
@@ -1162,7 +1405,11 @@ export default function App() {
           toneDescription: row.toneDescription || toneDescription,
           status: "idle",
         }));
-        setBulkItems(parsed);
+        if (isManualAction) {
+          updateBulkItemsWithUndo(parsed);
+        } else {
+          setBulkItems(parsed);
+        }
         setBulkUploadError(null);
       } catch (err: any) {
         setBulkUploadError("CSV parsing error. Ensure proper double quotes and structure.");
@@ -1189,10 +1436,37 @@ export default function App() {
         continue;
       }
 
-      setBulkItems(prev => prev.map(p => p.id === item.id ? { ...p, status: "generating" } : p));
+      setBulkItems(prev => prev.map(p => p.id === item.id ? { 
+        ...p, 
+        status: "generating",
+        progressText: "Initiating: 10%",
+        error: undefined
+      } : p));
       setBulkProgressIndex(i);
 
+      // We'll set a stateful tracking variable we can clear in the try/catch
+      let progressTimer: any = null;
+
       try {
+        let progressVal = 10;
+        progressTimer = setInterval(() => {
+          if (progressVal < 85) {
+            progressVal += Math.floor(Math.random() * 8) + 4;
+            if (progressVal > 85) progressVal = 85;
+
+            let stage = "Synthesizing";
+            if (progressVal < 30) stage = "Connecting";
+            else if (progressVal < 55) stage = "Synthesizing";
+            else if (progressVal < 75) stage = "Encoding";
+            else stage = "Processing";
+
+            setBulkItems(prev => prev.map(p => p.id === item.id && p.status === "generating" ? {
+              ...p,
+              progressText: `${stage}: ${progressVal}%`
+            } : p));
+          }
+        }, 150);
+
         const response = await fetch("/api/generate-tts", {
           method: "POST",
           headers: {
@@ -1205,6 +1479,8 @@ export default function App() {
           }),
         });
 
+        clearInterval(progressTimer);
+
         const data = await response.json();
         if (!response.ok) {
           throw new Error(data.error || "Synthesis failed.");
@@ -1214,6 +1490,12 @@ export default function App() {
           throw new Error("Empty audio returned.");
         }
 
+        // Quick decode phase update
+        setBulkItems(prev => prev.map(p => p.id === item.id ? {
+          ...p,
+          progressText: "Decoding: 92%"
+        } : p));
+
         const decoded = await decodeB64ToAudioBuffer(data.base64Audio);
 
         setBulkItems(prev => prev.map(p => p.id === item.id ? {
@@ -1222,15 +1504,34 @@ export default function App() {
           base64Audio: data.base64Audio,
           audioBuffer: decoded.buffer,
           duration: decoded.buffer.duration,
+          progressText: "Done",
           error: undefined,
         } : p));
 
       } catch (err: any) {
+        if (progressTimer) clearInterval(progressTimer);
         console.error(`Error generating bulk item ${i + 1}:`, err);
+        
+        // Clean up error message for user friendly status display
+        let errMsg = err.message || "Synthesis failed";
+        let shortMsg = "API Error";
+        if (errMsg.toLowerCase().includes("rate limit") || errMsg.includes("429")) {
+          shortMsg = "API Error: Rate Limit";
+        } else if (errMsg.toLowerCase().includes("network") || errMsg.toLowerCase().includes("fetch")) {
+          shortMsg = "Conn Error: Offline";
+        } else if (errMsg.toLowerCase().includes("voice")) {
+          shortMsg = "API Error: Bad Voice";
+        } else {
+          // Limit error length to keep layout neat but readable
+          const cleanErr = errMsg.replace(/^error:\s*/i, "");
+          shortMsg = cleanErr.length > 25 ? `Err: ${cleanErr.substring(0, 22)}...` : `Err: ${cleanErr}`;
+        }
+
         setBulkItems(prev => prev.map(p => p.id === item.id ? {
           ...p,
           status: "failed",
-          error: err.message || "Synthesis failed",
+          error: errMsg,
+          progressText: shortMsg,
         } : p));
       }
 
@@ -1434,10 +1735,10 @@ export default function App() {
         setBulkInputText(content);
         if (file.name.endsWith(".csv")) {
           setBulkFormat("csv");
-          handleParseBulkScripts(content, "csv");
+          handleParseBulkScripts(content, "csv", true);
         } else {
           setBulkFormat("lines");
-          handleParseBulkScripts(content, "lines");
+          handleParseBulkScripts(content, "lines", true);
         }
       }
     };
@@ -1822,6 +2123,7 @@ export default function App() {
         const ambientGain = ctx.createGain();
         ambientGain.gain.value = ambientVolume / 100;
         ambientGain.connect(gainNode); // mix with master volume
+        ambientGainNodeRef.current = ambientGain;
 
         if (ambientTrack === "space") {
           // Deep Space Drone (procedural synth low-end drone)
@@ -1937,8 +2239,43 @@ export default function App() {
       gainNodeRef.current = gainNode;
       analyserNodeRef.current = analyserNode;
 
-      // Calculate resume offset
-      const offset = pausedAtRef.current;
+      // Calculate resume offset with interactive trim boundaries
+      const duration = buffer.duration;
+      const trimStartSec = trimStartRatio * duration;
+      const trimEndSec = trimEndRatio * duration;
+
+      let offset = pausedAtRef.current;
+      if (offset < trimStartSec || offset > trimEndSec) {
+        offset = trimStartSec;
+      }
+
+      // Real-time visual fade-in and fade-out to prevent pops/clicks at audio boundaries
+      const now = ctx.currentTime;
+      if (fadeInDuration > 0 && offset < trimStartSec + fadeInDuration) {
+        gainNode.gain.setValueAtTime(0, now);
+        const rampDuration = Math.max(0.01, (trimStartSec + fadeInDuration - offset) / playbackSpeed);
+        gainNode.gain.linearRampToValueAtTime(playGain, now + rampDuration);
+      } else {
+        gainNode.gain.setValueAtTime(playGain, now);
+      }
+
+      if (fadeOutDuration > 0) {
+        const totalDur = trimEndSec;
+        const fadeOutStartOffset = totalDur - fadeOutDuration;
+        if (offset < fadeOutStartOffset) {
+          const timeToFadeOutStart = (fadeOutStartOffset - offset) / playbackSpeed;
+          const timeToFadeOutEnd = (totalDur - offset) / playbackSpeed;
+          gainNode.gain.setValueAtTime(playGain, now + timeToFadeOutStart);
+          gainNode.gain.linearRampToValueAtTime(0, now + timeToFadeOutEnd);
+        } else if (offset < totalDur) {
+          const currentFadeRatio = Math.max(0, (totalDur - offset) / fadeOutDuration);
+          const initialVolume = playGain * currentFadeRatio;
+          gainNode.gain.setValueAtTime(initialVolume, now);
+          const timeToFadeOutEnd = (totalDur - offset) / playbackSpeed;
+          gainNode.gain.linearRampToValueAtTime(0, now + timeToFadeOutEnd);
+        }
+      }
+
       sourceNode.start(0, offset);
       startTimeRef.current = ctx.currentTime - offset / playbackSpeed;
       
@@ -1948,11 +2285,11 @@ export default function App() {
       sourceNode.onended = () => {
         // Only trigger ended if it finished naturally
         const playedDuration = (ctx.currentTime - startTimeRef.current) * playbackSpeed;
-        if (playedDuration >= buffer!.duration - 0.1) {
+        if (playedDuration >= trimEndSec - 0.1) {
           setIsPlaying(false);
-          setCurrentTime(0);
-          setPlaybackProgress(0);
-          pausedAtRef.current = 0;
+          setCurrentTime(trimStartSec);
+          setPlaybackProgress(trimStartRatio * 100);
+          pausedAtRef.current = trimStartSec;
         }
       };
 
@@ -1983,6 +2320,7 @@ export default function App() {
       });
       activeAmbientNodesRef.current = [];
     }
+    ambientGainNodeRef.current = null;
 
     const ctx = audioCtxRef.current;
     const elapsed = (ctx.currentTime - startTimeRef.current) * playbackSpeed;
@@ -2008,6 +2346,7 @@ export default function App() {
       });
       activeAmbientNodesRef.current = [];
     }
+    ambientGainNodeRef.current = null;
 
     pausedAtRef.current = 0;
     setCurrentTime(0);
@@ -2022,11 +2361,24 @@ export default function App() {
     const ctx = audioCtxRef.current;
     const elapsed = (ctx.currentTime - startTimeRef.current) * playbackSpeed;
     const duration = audioBufferRef.current.duration;
+    const trimStartSec = trimStartRatio * duration;
+    const trimEndSec = trimEndRatio * duration;
 
-    if (elapsed <= duration) {
+    if (elapsed <= trimEndSec) {
       setCurrentTime(elapsed);
       setPlaybackProgress((elapsed / duration) * 100);
       requestAnimationFrame(trackPlayback);
+    } else {
+      // Stopped precisely at trim end marker
+      setIsPlaying(false);
+      pausedAtRef.current = trimStartSec;
+      setCurrentTime(trimStartSec);
+      setPlaybackProgress(trimStartRatio * 100);
+      if (sourceNodeRef.current) {
+        try {
+          sourceNodeRef.current.stop();
+        } catch (e) {}
+      }
     }
   };
 
@@ -2034,12 +2386,19 @@ export default function App() {
   const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!audioBufferRef.current) return;
     const percent = parseFloat(e.target.value);
-    const targetSeconds = (percent / 100) * audioBufferRef.current.duration;
+    const duration = audioBufferRef.current.duration;
+    let targetSeconds = (percent / 100) * duration;
     
+    const trimStartSec = trimStartRatio * duration;
+    const trimEndSec = trimEndRatio * duration;
+
+    if (targetSeconds < trimStartSec) targetSeconds = trimStartSec;
+    if (targetSeconds > trimEndSec) targetSeconds = trimEndSec;
+
     stopAudio();
     pausedAtRef.current = targetSeconds;
     setCurrentTime(targetSeconds);
-    setPlaybackProgress(percent);
+    setPlaybackProgress((targetSeconds / duration) * 100);
     
     // Resume automatically if it was playing
     if (isPlaying || base64Audio) {
@@ -2249,6 +2608,26 @@ export default function App() {
       const dataArray = new Uint8Array(bufferLength);
       analyser.getByteTimeDomainData(dataArray);
 
+      // Real-time Ducking evaluation based on actual voice amplitude
+      if (autoDuckingEnabled && ambientGainNodeRef.current && audioCtxRef.current) {
+        let sumSquares = 0;
+        for (let i = 0; i < bufferLength; i++) {
+          const val = (dataArray[i] - 128) / 128;
+          sumSquares += val * val;
+        }
+        const rms = Math.sqrt(sumSquares / bufferLength);
+        
+        // Threshold of 0.012 separates human voice presence from background/digital noise
+        const isSpeaking = rms > 0.012;
+        
+        // Target: duck background soundscape volume to 25% when speaking, restore to 100% when silent/paused
+        const targetMultiplier = isSpeaking ? 0.25 : 1.0;
+        const targetGain = (targetMultiplier * ambientVolume) / 100;
+        
+        const ctxTime = audioCtxRef.current.currentTime;
+        ambientGainNodeRef.current.gain.setTargetAtTime(targetGain, ctxTime, 0.12);
+      }
+
       ctx.lineWidth = 3;
       ctx.strokeStyle = "rgba(74, 222, 128, 0.95)"; // Vibrant neon green vacuum tube color
       ctx.shadowBlur = 10;
@@ -2294,11 +2673,6 @@ export default function App() {
       const step = windowSize / width;
       const samplesPerPixel = Math.max(1, Math.floor(windowSize / width));
 
-      ctx.strokeStyle = "rgba(74, 222, 128, 0.85)";
-      ctx.lineWidth = 1.5;
-      ctx.shadowBlur = 4;
-      ctx.shadowColor = "rgba(74, 222, 128, 0.4)";
-
       for (let x = 0; x < width; x++) {
         const chunkStart = Math.floor(startSample + x * step);
         const chunkEnd = Math.min(data.length, chunkStart + samplesPerPixel);
@@ -2313,10 +2687,58 @@ export default function App() {
         const yMin = height / 2 + (min * (height / 2) * 0.95);
         const yMax = height / 2 + (max * (height / 2) * 0.95);
 
+        const currentRatio = chunkStart / data.length;
+        const isTrimmed = currentRatio < trimStartRatio || currentRatio > trimEndRatio;
+
+        if (isTrimmed) {
+          ctx.strokeStyle = "rgba(142, 146, 153, 0.2)";
+          ctx.shadowBlur = 0;
+        } else {
+          ctx.strokeStyle = "rgba(74, 222, 128, 0.85)";
+          ctx.shadowBlur = 4;
+          ctx.shadowColor = "rgba(74, 222, 128, 0.4)";
+        }
+
         ctx.beginPath();
         ctx.moveTo(x, yMin);
         ctx.lineTo(x, yMax);
         ctx.stroke();
+      }
+
+      ctx.shadowBlur = 0;
+
+      // Draw trim start and trim end line markers
+      const trimStartSample = trimStartRatio * data.length;
+      const trimEndSample = trimEndRatio * data.length;
+
+      // Trim Start Marker
+      if (trimStartSample >= startSample && trimStartSample <= startSample + windowSize) {
+        const markerX = ((trimStartSample - startSample) / windowSize) * width;
+        ctx.strokeStyle = "#F59E0B"; // Warm amber trim start marker
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        ctx.moveTo(markerX, 0);
+        ctx.lineTo(markerX, height);
+        ctx.stroke();
+
+        // Draw a handle block at the top
+        ctx.fillStyle = "#F59E0B";
+        ctx.fillRect(markerX - 4, 0, 8, 8);
+      }
+
+      // Trim End Marker
+      if (trimEndSample >= startSample && trimEndSample <= startSample + windowSize) {
+        const markerX = ((trimEndSample - startSample) / windowSize) * width;
+        ctx.strokeStyle = "#EF4444"; // Vivid red trim end marker
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        ctx.moveTo(markerX, 0);
+        ctx.lineTo(markerX, height);
+        ctx.stroke();
+
+        // Draw a handle block at the bottom
+        ctx.fillStyle = "#EF4444";
+        ctx.fillRect(markerX - 4, height - 8, 8, 8);
       }
 
       // Draw active playhead indicator if audio duration is present
@@ -2373,6 +2795,126 @@ export default function App() {
     }
   };
 
+  // Interactive drag-trim canvas handlers
+  const handleCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!audioBufferRef.current) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const ratioInViewport = mouseX / rect.width;
+
+    const data = audioBufferRef.current.getChannelData(0);
+    const windowSize = data.length / waveformZoom;
+    const maxStart = data.length - windowSize;
+    const startSample = Math.floor((waveformPan / 100) * maxStart);
+
+    const mouseSample = startSample + ratioInViewport * windowSize;
+    const mouseRatio = Math.max(0, Math.min(1, mouseSample / data.length));
+
+    const distStart = Math.abs(mouseRatio - trimStartRatio);
+    const distEnd = Math.abs(mouseRatio - trimEndRatio);
+
+    const thresholdRatio = Math.max(0.01, (windowSize * 0.08) / data.length);
+
+    if (distStart < distEnd && distStart < thresholdRatio) {
+      setActiveDragHandle("start");
+    } else if (distEnd < thresholdRatio) {
+      setActiveDragHandle("end");
+    } else {
+      const clickThreshold = Math.max(0.01, (windowSize * 0.12) / data.length);
+      if (distStart < distEnd && distStart < clickThreshold) {
+        setActiveDragHandle("start");
+      } else if (distEnd < clickThreshold) {
+        setActiveDragHandle("end");
+      }
+    }
+  };
+
+  const handleCanvasMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!activeDragHandle || !audioBufferRef.current) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const ratioInViewport = mouseX / rect.width;
+
+    const data = audioBufferRef.current.getChannelData(0);
+    const windowSize = data.length / waveformZoom;
+    const maxStart = data.length - windowSize;
+    const startSample = Math.floor((waveformPan / 100) * maxStart);
+
+    const mouseSample = startSample + ratioInViewport * windowSize;
+    const mouseRatio = Math.max(0, Math.min(1, mouseSample / data.length));
+
+    if (activeDragHandle === "start") {
+      setTrimStartRatio(Math.min(mouseRatio, trimEndRatio - 0.02));
+    } else {
+      setTrimEndRatio(Math.max(mouseRatio, trimStartRatio + 0.02));
+    }
+  };
+
+  const handleCanvasMouseUpOrLeave = () => {
+    setActiveDragHandle(null);
+  };
+
+  const handleCanvasTouchStart = (e: React.TouchEvent<HTMLCanvasElement>) => {
+    if (e.touches.length === 0 || !audioBufferRef.current) return;
+    const touch = e.touches[0];
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const mouseX = touch.clientX - rect.left;
+    const ratioInViewport = mouseX / rect.width;
+
+    const data = audioBufferRef.current.getChannelData(0);
+    const windowSize = data.length / waveformZoom;
+    const maxStart = data.length - windowSize;
+    const startSample = Math.floor((waveformPan / 100) * maxStart);
+
+    const mouseSample = startSample + ratioInViewport * windowSize;
+    const mouseRatio = Math.max(0, Math.min(1, mouseSample / data.length));
+
+    const distStart = Math.abs(mouseRatio - trimStartRatio);
+    const distEnd = Math.abs(mouseRatio - trimEndRatio);
+
+    const thresholdRatio = Math.max(0.01, (windowSize * 0.12) / data.length);
+
+    if (distStart < distEnd && distStart < thresholdRatio) {
+      setActiveDragHandle("start");
+    } else if (distEnd < thresholdRatio) {
+      setActiveDragHandle("end");
+    }
+  };
+
+  const handleCanvasTouchMove = (e: React.TouchEvent<HTMLCanvasElement>) => {
+    if (!activeDragHandle || e.touches.length === 0 || !audioBufferRef.current) return;
+    const touch = e.touches[0];
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const mouseX = touch.clientX - rect.left;
+    const ratioInViewport = mouseX / rect.width;
+
+    const data = audioBufferRef.current.getChannelData(0);
+    const windowSize = data.length / waveformZoom;
+    const maxStart = data.length - windowSize;
+    const startSample = Math.floor((waveformPan / 100) * maxStart);
+
+    const mouseSample = startSample + ratioInViewport * windowSize;
+    const mouseRatio = Math.max(0, Math.min(1, mouseSample / data.length));
+
+    if (activeDragHandle === "start") {
+      setTrimStartRatio(Math.min(mouseRatio, trimEndRatio - 0.02));
+    } else {
+      setTrimEndRatio(Math.max(mouseRatio, trimStartRatio + 0.02));
+    }
+  };
+
   // Helper to compile a standard RIFF/WAVE header and initiate client download
   const downloadWav = () => {
     if (!base64Audio) return;
@@ -2387,6 +2929,13 @@ export default function App() {
 
       let pcm16 = new Int16Array(bytes.buffer);
       const sampleRate = 24000;
+
+      // Apply the user's interactive drag trim boundaries!
+      if (trimStartRatio > 0 || trimEndRatio < 1) {
+        const startIndex = Math.floor(trimStartRatio * pcm16.length);
+        const endIndex = Math.floor(trimEndRatio * pcm16.length);
+        pcm16 = pcm16.subarray(startIndex, Math.min(endIndex, pcm16.length));
+      }
 
       if (trimSilence) {
         const threshold = 300;
@@ -2468,10 +3017,11 @@ export default function App() {
   const exportCompressedMp3 = () => {
     if (!base64Audio) return;
     setIsExportingMp3(true);
+    setMp3ExportProgress(0);
     setError(null);
 
     // Run on timeout to allow UI loading spinner to render
-    setTimeout(() => {
+    setTimeout(async () => {
       try {
         const binaryString = window.atob(base64Audio);
         const len = binaryString.length;
@@ -2526,26 +3076,48 @@ export default function App() {
         const mp3Data: any[] = [];
         const sampleBlockSize = 1152;
 
-        for (let i = 0; i < pcm16.length; i += sampleBlockSize) {
-          const sampleChunk = pcm16.subarray(i, i + sampleBlockSize);
-          let chunkToEncode = sampleChunk;
-          
-          // Pad last block with zeros if it is not a multiple of sampleBlockSize (1152)
-          if (sampleChunk.length < sampleBlockSize) {
-            chunkToEncode = new Int16Array(sampleBlockSize);
-            chunkToEncode.set(sampleChunk);
+        const totalSamples = pcm16.length;
+        let index = 0;
+
+        const processChunk = async () => {
+          // Process 10 blocks at a time (around 11,520 samples) to ensure responsiveness and smooth UI animation
+          const chunkLimit = Math.min(index + sampleBlockSize * 10, totalSamples);
+          for (let i = index; i < chunkLimit; i += sampleBlockSize) {
+            const sampleChunk = pcm16.subarray(i, i + sampleBlockSize);
+            let chunkToEncode = sampleChunk;
+            
+            // Pad last block with zeros if it is not a multiple of sampleBlockSize (1152)
+            if (sampleChunk.length < sampleBlockSize) {
+              chunkToEncode = new Int16Array(sampleBlockSize);
+              chunkToEncode.set(sampleChunk);
+            }
+            
+            const mp3buf = encoder.encodeBuffer(chunkToEncode);
+            if (mp3buf.length > 0) {
+              mp3Data.push(mp3buf);
+            }
           }
           
-          const mp3buf = encoder.encodeBuffer(chunkToEncode);
-          if (mp3buf.length > 0) {
-            mp3Data.push(mp3buf);
+          index = chunkLimit;
+          const pct = Math.min(99, Math.round((index / totalSamples) * 100));
+          setMp3ExportProgress(pct);
+
+          if (index < totalSamples) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            await processChunk();
           }
-        }
+        };
+
+        await processChunk();
 
         const mp3buf = encoder.flush();
         if (mp3buf.length > 0) {
           mp3Data.push(mp3buf);
         }
+        setMp3ExportProgress(100);
+
+        // Quick pause to show 100% complete
+        await new Promise((resolve) => setTimeout(resolve, 100));
 
         const blob = new Blob(mp3Data, { type: "audio/mp3" });
         const url = URL.createObjectURL(blob);
@@ -2561,6 +3133,7 @@ export default function App() {
         setError("Could not compile audio to 192kbps MP3 format.");
       } finally {
         setIsExportingMp3(false);
+        setMp3ExportProgress(0);
       }
     }, 100);
   };
@@ -2818,6 +3391,40 @@ export default function App() {
           </span>
         </div>
       </header>
+
+      {/* Shared audio loading overlay or banner */}
+      <AnimatePresence>
+        {isLoadingShared && (
+          <motion.div
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: "auto" }}
+            exit={{ opacity: 0, height: 0 }}
+            className="bg-blue-950/30 border-b border-blue-500/30 text-blue-400 p-4 flex items-center justify-center gap-3 font-mono text-xs z-40 shadow-[0_4px_12px_rgba(0,0,0,0.5)] overflow-hidden"
+          >
+            <RefreshCw className="h-4 w-4 animate-spin text-blue-400" />
+            <span className="font-bold text-white tracking-wide uppercase">Retrieving Shared Voiceover Data...</span>
+            <span className="text-slate-300">Please wait while we load the generated voice model from the cloud...</span>
+          </motion.div>
+        )}
+        {sharedLoadError && (
+          <motion.div
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: "auto" }}
+            exit={{ opacity: 0, height: 0 }}
+            className="bg-rose-950/20 border-b border-rose-500/30 text-rose-400 p-4 flex items-center justify-center gap-3 font-mono text-xs z-40 overflow-hidden"
+          >
+            <AlertCircle className="h-4 w-4 text-rose-500" />
+            <span className="font-bold text-white tracking-wide uppercase">Share Link Error:</span>
+            <span>{sharedLoadError}</span>
+            <button
+              onClick={() => setSharedLoadError(null)}
+              className="ml-4 px-2 py-0.5 bg-rose-900/30 border border-rose-500/30 text-rose-300 rounded hover:bg-rose-800/30 text-[10px] cursor-pointer"
+            >
+              Dismiss
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Main Single-View Application Stage */}
       <main className="max-w-7xl mx-auto w-full p-4 sm:p-6 grid grid-cols-1 lg:grid-cols-12 gap-6 flex-grow">
@@ -3363,6 +3970,31 @@ export default function App() {
                   <p className="text-[8px] text-[#5C616A] font-mono text-center italic">
                     Mixed dynamically in-browser under the narration track. Adjust to blend.
                   </p>
+
+                  {/* Dynamic Speech Auto-Ducking Toggle and Indicator */}
+                  <div className="bg-[#0B0C0E]/50 border border-[#2D3036]/40 rounded p-2.5 space-y-2 font-mono mt-1">
+                    <div className="flex items-center justify-between text-[9px]">
+                      <span className="text-[#8E9299] font-bold uppercase tracking-wider flex items-center gap-1.5">
+                        <span className={`w-1.5 h-1.5 rounded-full ${autoDuckingEnabled && isPlaying ? "bg-blue-400 animate-pulse" : "bg-zinc-600"}`} />
+                        Speech Auto-Ducking
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setAutoDuckingEnabled(!autoDuckingEnabled)}
+                        className={`px-2 py-0.5 rounded text-[8px] font-bold tracking-wider uppercase border transition-all cursor-pointer ${
+                          autoDuckingEnabled
+                            ? "bg-blue-500/10 border-blue-400/40 text-blue-400"
+                            : "bg-[#14161B] border-[#2D3036] text-[#5C616A] hover:border-[#8E9299]/50"
+                        }`}
+                        id="toggle-auto-ducking"
+                      >
+                        {autoDuckingEnabled ? "ENABLED" : "DISABLED"}
+                      </button>
+                    </div>
+                    <p className="text-[8px] text-[#5C616A] leading-relaxed">
+                      Automatically reduces background soundscapes by 75% when the narration speaks, smoothly restoring full volume during natural pauses or silences.
+                    </p>
+                  </div>
                 </div>
               )}
             </div>
@@ -3544,6 +4176,35 @@ export default function App() {
                     Estimates words-per-minute (WPM) speed by analyzing natural audio transient levels. Highlight parts of the script reading significantly faster or slower than the average.
                   </p>
 
+                  {/* WPM Target Threshold Config */}
+                  <div className="bg-[#0B0C0E]/50 border border-[#2D3036]/40 rounded p-2.5 space-y-2 font-mono">
+                    <div className="flex items-center justify-between text-[9.5px]">
+                      <span className="text-[#8E9299] font-bold uppercase tracking-wider">Target WPM Threshold:</span>
+                      <span className="text-white font-bold">{targetWpm} <span className="text-[8px] font-normal text-[#5C616A]">WPM</span></span>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <input
+                        type="range"
+                        min="80"
+                        max="240"
+                        step="5"
+                        value={targetWpm}
+                        onChange={(e) => handleTargetWpmChange(parseInt(e.target.value))}
+                        className="flex-1 h-1 bg-[#1A1C20] rounded-lg appearance-none cursor-pointer accent-emerald-400"
+                        id="slider-target-wpm"
+                      />
+                      <input
+                        type="number"
+                        min="1"
+                        max="500"
+                        value={targetWpm}
+                        onChange={(e) => handleTargetWpmChange(parseInt(e.target.value) || 150)}
+                        className="w-14 bg-[#14161B] border border-[#2D3036] text-[10px] text-center text-white py-0.5 rounded font-bold"
+                        id="input-target-wpm"
+                      />
+                    </div>
+                  </div>
+
                   {!isSynced ? (
                     <button
                       onClick={handleSyncScript}
@@ -3561,26 +4222,47 @@ export default function App() {
                   ) : (
                     <div className="space-y-4 font-mono">
                       {/* Sync Metrics Header */}
-                      <div className="grid grid-cols-3 gap-2 bg-[#0B0C0E] p-3 rounded border border-[#2D3036]/60 text-center">
-                        <div className="space-y-0.5">
+                      <div className="grid grid-cols-3 gap-2 text-center">
+                        <div className={`p-3 rounded border transition-all ${
+                          averageWpm > targetWpm
+                            ? "bg-rose-950/20 border-rose-500/40 text-rose-400 shadow-[0_0_10px_rgba(244,63,94,0.1)]"
+                            : "bg-[#0B0C0E] border-[#2D3036]/60 text-white"
+                        }`}>
                           <span className="text-[8px] text-[#5C616A] uppercase tracking-wider block font-bold">Average Pace</span>
-                          <span className="text-xs font-bold text-white block">
+                          <span className={`text-xs font-bold block ${averageWpm > targetWpm ? "text-rose-400" : "text-white"}`}>
                             {Math.round(averageWpm)} <span className="text-[9px] font-normal text-[#8E9299]">WPM</span>
                           </span>
                         </div>
-                        <div className="space-y-0.5 border-x border-[#2D3036]/40">
+                        <div className={`p-3 rounded border transition-all border-x ${
+                          averageWpm > targetWpm
+                            ? "bg-rose-950/10 border-[#2D3036]/60 text-rose-400"
+                            : "bg-[#0B0C0E] border-[#2D3036]/60 text-white"
+                        }`}>
                           <span className="text-[8px] text-[#5C616A] uppercase tracking-wider block font-bold">Pace Category</span>
                           <span className={`text-[10px] font-bold block uppercase ${
-                            averageWpm > 165 ? "text-amber-400" : averageWpm < 120 ? "text-blue-400" : "text-[#4ADE80]"
+                            averageWpm > targetWpm 
+                              ? "text-rose-500 animate-pulse font-extrabold"
+                              : averageWpm > 165 
+                                ? "text-amber-400" 
+                                : averageWpm < 120 
+                                  ? "text-blue-400" 
+                                  : "text-[#4ADE80]"
                           }`}>
-                            {averageWpm > 165 ? "Fast Pace" : averageWpm < 120 ? "Slow Pace" : "Optimal"}
+                            {averageWpm > targetWpm ? "EXCEEDS TARGET" : averageWpm > 165 ? "Fast Pace" : averageWpm < 120 ? "Slow Pace" : "Optimal"}
                           </span>
                         </div>
-                        <div className="space-y-0.5">
+                        <div className="bg-[#0B0C0E] p-3 rounded border border-[#2D3036]/60 text-center">
                           <span className="text-[8px] text-[#5C616A] uppercase tracking-wider block font-bold">Phrases</span>
                           <span className="text-xs font-bold text-slate-300 block">{syncSegments.length}</span>
                         </div>
                       </div>
+
+                      {averageWpm > targetWpm && (
+                        <div className="bg-rose-500/10 border border-rose-500/30 p-2.5 rounded text-[10px] text-rose-400 flex items-center gap-2">
+                          <span className="inline-block w-1.5 h-1.5 rounded-full bg-rose-500 animate-ping" />
+                          <span>Pacing warning: Speed ({Math.round(averageWpm)} WPM) exceeds your target limit of {targetWpm} WPM.</span>
+                        </div>
+                      )}
 
                       {/* Interactive Scannable Script Blocks */}
                       <div className="space-y-2 max-h-[240px] overflow-y-auto pr-1">
@@ -3656,7 +4338,7 @@ export default function App() {
                     <button
                       onClick={() => {
                         setBulkFormat("lines");
-                        handleParseBulkScripts(bulkInputText, "lines");
+                        handleParseBulkScripts(bulkInputText, "lines", true);
                       }}
                       className={`text-[9.5px] px-3 py-1.5 rounded font-mono font-bold cursor-pointer uppercase border transition-all ${
                         bulkFormat === "lines"
@@ -3669,7 +4351,7 @@ export default function App() {
                     <button
                       onClick={() => {
                         setBulkFormat("csv");
-                        handleParseBulkScripts(bulkInputText, "csv");
+                        handleParseBulkScripts(bulkInputText, "csv", true);
                       }}
                       className={`text-[9.5px] px-3 py-1.5 rounded font-mono font-bold cursor-pointer uppercase border transition-all ${
                         bulkFormat === "csv"
@@ -3690,7 +4372,7 @@ export default function App() {
                       onClick={() => {
                         const t = `Target acquired. Locking active acoustic channels.\nRunning terminal diagnostic sequence.\nSignal chain calibrated to baseline standards.`;
                         setBulkInputText(t);
-                        handleParseBulkScripts(t, "lines");
+                        handleParseBulkScripts(t, "lines", true);
                         setBulkFormat("lines");
                       }}
                       className="text-[9px] bg-[#15171C] hover:bg-[#1C1F26] text-white border border-[#2D3036] px-2 py-1 rounded transition-colors uppercase"
@@ -3701,7 +4383,7 @@ export default function App() {
                       onClick={() => {
                         const t = `Text,Voice,Tone\n"System initialized. Core operational.",Charon,"low pitch, deep resonant cinematic voice"\n"Warning: Transient signal anomaly detected.",Fenrir,"urgent, commanding dry baritone broadcast"\n"Acoustic frequency scan completed.",Zephyr,"neutral tone, slow paced, technical readout"`;
                         setBulkInputText(t);
-                        handleParseBulkScripts(t, "csv");
+                        handleParseBulkScripts(t, "csv", true);
                         setBulkFormat("csv");
                       }}
                       className="text-[9px] bg-[#15171C] hover:bg-[#1C1F26] text-white border border-[#2D3036] px-2 py-1 rounded transition-colors uppercase"
@@ -3771,7 +4453,7 @@ export default function App() {
                           </span>
                         )}
                         <button
-                          onClick={() => handleParseBulkScripts(bulkInputText, bulkFormat)}
+                          onClick={() => handleParseBulkScripts(bulkInputText, bulkFormat, true)}
                           className="text-[10px] bg-[#4ADE80]/10 hover:bg-[#4ADE80]/20 text-[#4ADE80] border border-[#4ADE80]/30 font-mono uppercase px-2.5 py-1 rounded transition-colors cursor-pointer"
                         >
                           Reparse Queue
@@ -3787,9 +4469,39 @@ export default function App() {
                     <span className="text-[10px] font-mono font-bold uppercase text-[#8E9299]">
                       Batch Queue Inspector
                     </span>
-                    <span className="text-[10px] font-mono text-[#4ADE80] bg-[#4ADE80]/10 border border-[#4ADE80]/20 px-2 py-0.5 rounded">
-                      {bulkItems.length} scripts parsed
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => setShowBulkTimelinePreview(!showBulkTimelinePreview)}
+                        disabled={bulkItems.length === 0}
+                        className={`flex items-center gap-1.5 text-[9px] font-mono px-2 py-0.5 rounded cursor-pointer transition-all uppercase font-bold border ${
+                          bulkItems.length === 0
+                            ? "bg-[#15171C] border-[#2D3036] text-[#5C616A] cursor-not-allowed"
+                            : showBulkTimelinePreview
+                              ? "bg-[#4ADE80]/15 border-[#4ADE80] text-[#4ADE80]"
+                              : "bg-[#15171C] border-[#2D3036] text-[#8E9299] hover:text-white"
+                        }`}
+                        title="Toggle split-pane interactive script preview & timeline visualization"
+                        id="btn-toggle-bulk-timeline"
+                      >
+                        <Eye className="h-3 w-3" />
+                        <span>{showBulkTimelinePreview ? "Show Queue" : "Preview Script"}</span>
+                      </button>
+
+                      {bulkUndoStack.length > 0 && (
+                        <button
+                          onClick={handleUndoBulkAction}
+                          className="flex items-center gap-1.5 text-[9px] font-mono text-blue-400 hover:text-blue-300 bg-blue-500/10 hover:bg-blue-500/20 border border-blue-500/20 hover:border-blue-500/40 px-2 py-0.5 rounded cursor-pointer transition-all uppercase font-bold"
+                          title="Undo the last batch operation (accidental deletion, reset or script change)"
+                          id="btn-undo-bulk"
+                        >
+                          <Undo2 className="h-3 w-3" />
+                          <span>Undo ({bulkUndoStack.length})</span>
+                        </button>
+                      )}
+                      <span className="text-[10px] font-mono text-[#4ADE80] bg-[#4ADE80]/10 border border-[#4ADE80]/20 px-2 py-0.5 rounded">
+                        {bulkItems.length} scripts parsed
+                      </span>
+                    </div>
                   </div>
 
                   {(() => {
@@ -3842,18 +4554,411 @@ export default function App() {
                             />
                           </div>
                         </div>
+
+                        {/* Filter Segmented Control */}
+                        <div className="bg-[#0D0F12] px-3.5 py-2 border-b border-[#2D3036] flex flex-wrap items-center justify-between gap-2 text-[9.5px] font-mono select-none">
+                          <span className="text-[#8E9299] uppercase font-bold text-[8.5px] tracking-wider">Filter Queue:</span>
+                          <div className="flex flex-wrap items-center gap-1">
+                            {[
+                              { label: "All", value: "all", count: bulkItems.length, color: "text-[#8E9299] bg-[#8E9299]/10" },
+                              { label: "Idle", value: "idle", count: bulkItems.filter(i => i.status === "idle").length, color: "text-[#5C616A] bg-[#5C616A]/10" },
+                              { label: "Active", value: "generating", count: bulkItems.filter(i => i.status === "generating").length, color: "text-[#4ADE80] bg-[#4ADE80]/10" },
+                              { label: "Completed", value: "completed", count: bulkItems.filter(i => i.status === "completed").length, color: "text-emerald-400 bg-emerald-500/10" },
+                              { label: "Failed", value: "failed", count: bulkItems.filter(i => i.status === "failed").length, color: "text-[#FF4444] bg-[#FF4444]/10" }
+                            ].map(tab => {
+                              const isActive = bulkFilter === tab.value;
+                              return (
+                                <button
+                                  key={tab.value}
+                                  onClick={() => setBulkFilter(tab.value as any)}
+                                  className={`px-2 py-1 rounded text-[9px] font-bold uppercase transition-all cursor-pointer border ${
+                                    isActive
+                                      ? "bg-[#1C1F26] border-[#4ADE80]/30 text-white shadow-[0_0_8px_rgba(74,222,128,0.1)]"
+                                      : "bg-transparent border-transparent text-[#5C616A] hover:text-[#8E9299] hover:bg-[#15171C]/50"
+                                  }`}
+                                  id={`btn-filter-bulk-${tab.value}`}
+                                >
+                                  <span>{tab.label}</span>
+                                  <span className={`ml-1.5 px-1 py-0.2 rounded text-[8px] font-mono border border-[#2D3036]/50 ${tab.color}`}>
+                                    {tab.count}
+                                  </span>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
                       </>
                     );
                   })()}
 
-                  <div className="max-h-[220px] overflow-y-auto divide-y divide-[#2D3036]/60 text-xs font-mono">
+                  {showBulkTimelinePreview ? (
+                    <div className="grid grid-cols-1 md:grid-cols-12 border-t border-[#2D3036]/60 bg-[#0C0E12] text-xs font-mono select-none" style={{ height: "350px" }}>
+                      {/* Left Pane: Segment Texts List */}
+                      <div className="md:col-span-5 flex flex-col border-r border-[#2D3036]/60 h-full overflow-hidden">
+                        <div className="bg-[#121419] px-3 py-2 border-b border-[#2D3036]/60 text-[9px] font-bold text-[#8E9299] uppercase tracking-wider flex justify-between items-center bg-[#0B0C0E]">
+                          <span>Segment Text Details</span>
+                          <span className="text-[8px] text-[#5C616A] lowercase italic">Hover segment to sync</span>
+                        </div>
+                        <div className="flex-grow overflow-y-auto divide-y divide-[#2D3036]/40 max-h-[315px]">
+                          {(() => {
+                            let cumulative = 0;
+                            return bulkItems.map((item, idx) => {
+                              const words = item.text ? item.text.split(/\s+/).filter(Boolean).length : 0;
+                              const estDur = Math.max(1.0, words * 0.45);
+                              const duration = item.status === "completed" && item.duration ? item.duration : estDur;
+                              const start = cumulative;
+                              const end = cumulative + duration;
+                              cumulative = end;
+
+                              const isHovered = hoveredSegmentIndex === idx;
+                              const isCompleted = item.status === "completed";
+                              const isGenerating = item.status === "generating";
+                              const isFailed = item.status === "failed";
+
+                              return (
+                                <div
+                                  key={item.id}
+                                  onMouseEnter={() => setHoveredSegmentIndex(idx)}
+                                  onMouseLeave={() => setHoveredSegmentIndex(null)}
+                                  className={`p-3 transition-colors text-left relative group ${
+                                    isHovered ? "bg-[#1F2937]/35" : "hover:bg-[#15171C]/40"
+                                  }`}
+                                >
+                                  <div className="flex items-center justify-between mb-1">
+                                    <div className="flex items-center gap-1.5 min-w-0">
+                                      <span className={`text-[9.5px] font-bold ${isHovered ? "text-[#4ADE80]" : "text-[#5C616A]"}`}>
+                                        [{String(idx + 1).padStart(2, "0")}]
+                                      </span>
+                                      <span className="text-[9.5px] text-white font-medium truncate max-w-[75px]" title={`Voice: ${item.voiceName}`}>
+                                        {item.voiceName}
+                                      </span>
+                                      <span className="text-[8px] text-[#5C616A] truncate max-w-xs" title={`Tone: ${item.toneDescription}`}>
+                                        {item.toneDescription}
+                                      </span>
+                                    </div>
+                                    <div className="flex items-center gap-1 shrink-0">
+                                      {isCompleted && (
+                                        <span className="text-[8px] text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-1 py-0.2 rounded font-bold">
+                                          {duration.toFixed(1)}s
+                                        </span>
+                                      )}
+                                      {isGenerating && (
+                                        <span className="text-[8px] text-amber-500 bg-amber-500/10 border border-amber-500/20 px-1 py-0.2 rounded animate-pulse font-bold max-w-[95px] truncate" title={item.progressText || "Generating..."}>
+                                          {item.progressText || "Gen..."}
+                                        </span>
+                                      )}
+                                      {isFailed && (
+                                        <span className="text-[8px] text-red-500 bg-red-500/10 border border-red-500/20 px-1 py-0.2 rounded font-bold max-w-[95px] truncate" title={item.error || "Failed"}>
+                                          {item.progressText || "Err"}
+                                        </span>
+                                      )}
+                                      {item.status === "idle" && (
+                                        <span className="text-[8px] text-[#5C616A] bg-[#2D3036]/30 border border-[#2D3036]/50 px-1 py-0.2 rounded">
+                                          {duration.toFixed(1)}s (est)
+                                        </span>
+                                      )}
+                                    </div>
+                                  </div>
+                                  <p className={`text-[10px] font-sans leading-relaxed line-clamp-2 transition-colors ${
+                                    isHovered ? "text-white" : "text-slate-400 group-hover:text-slate-300"
+                                  }`}>
+                                    {item.text}
+                                  </p>
+                                  <div className="mt-1.5 flex items-center justify-between">
+                                    <span className="text-[8px] text-[#5C616A]">
+                                      Span: {start.toFixed(1)}s - {end.toFixed(1)}s
+                                    </span>
+                                    {isCompleted && item.audioBuffer && (
+                                      <button
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          handlePlayBulkItem(item);
+                                        }}
+                                        className="text-[8px] text-[#4ADE80] hover:text-[#22C55E] flex items-center gap-0.5 bg-[#4ADE80]/10 hover:bg-[#4ADE80]/20 border border-[#4ADE80]/20 px-1 py-0.2 rounded cursor-pointer transition-colors"
+                                      >
+                                        <Play className="h-2 w-2 fill-current" />
+                                        Play
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
+                              );
+                            });
+                          })()}
+                        </div>
+                      </div>
+
+                      {/* Right Pane: Chronological Timeline Visualization */}
+                      <div className="md:col-span-7 flex flex-col h-full overflow-hidden bg-[#08090C]">
+                        <div className="bg-[#121419] px-3 py-2 border-b border-[#2D3036]/60 text-[9px] font-bold text-[#8E9299] uppercase tracking-wider flex justify-between items-center bg-[#0B0C0E]">
+                          <span>Chronological Track Timeline</span>
+                          <span className="text-[#4ADE80] font-bold">
+                            {(() => {
+                              let cumulative = 0;
+                              bulkItems.forEach(item => {
+                                const words = item.text ? item.text.split(/\s+/).filter(Boolean).length : 0;
+                                const estDur = Math.max(1.0, words * 0.45);
+                                const duration = item.status === "completed" && item.duration ? item.duration : estDur;
+                                cumulative += duration;
+                              });
+                              return `${cumulative.toFixed(1)}s Total`;
+                            })()}
+                          </span>
+                        </div>
+
+                        {/* Visual Timeline Ruler and Channels */}
+                        <div className="flex-grow flex flex-col overflow-hidden p-3 space-y-3">
+                          {(() => {
+                            let cumulative = 0;
+                            const timelineSegments = bulkItems.map((item, idx) => {
+                              const words = item.text ? item.text.split(/\s+/).filter(Boolean).length : 0;
+                              const estDur = Math.max(1.0, words * 0.45);
+                              const duration = item.status === "completed" && item.duration ? item.duration : estDur;
+                              const startTime = cumulative;
+                              const endTime = cumulative + duration;
+                              cumulative = endTime;
+                              return { startTime, endTime, duration };
+                            });
+                            const totalDuration = cumulative || 1;
+
+                            // Dynamic timeline ruler ticks (every 5s, 10s or 20s)
+                            const tickInterval = totalDuration > 100 ? 20 : totalDuration > 40 ? 10 : 5;
+                            const ticksCount = Math.ceil(totalDuration / tickInterval) + 1;
+                            const ticks = Array.from({ length: ticksCount }).map((_, i) => i * tickInterval);
+
+                            return (
+                              <div className="flex-grow flex flex-col justify-between overflow-hidden select-none space-y-2">
+                                {/* Time Ruler */}
+                                <div className="relative h-5 border-b border-[#2D3036]/40 text-[7.5px] text-[#5C616A] font-mono shrink-0">
+                                  {ticks.map(tick => {
+                                    const leftPercent = (tick / totalDuration) * 100;
+                                    if (leftPercent > 100) return null;
+                                    return (
+                                      <div
+                                        key={tick}
+                                        className="absolute transform -translate-x-1/2 flex flex-col items-center h-full justify-between"
+                                        style={{ left: `${leftPercent}%` }}
+                                      >
+                                        <span>{tick}s</span>
+                                        <div className="w-[1px] h-1.5 bg-[#2D3036]" />
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+
+                                {/* Stacked Rows */}
+                                <div className="flex-grow space-y-1.5 overflow-y-auto pr-1 max-h-[195px]">
+                                  {bulkItems.map((item, idx) => {
+                                    const seg = timelineSegments[idx];
+                                    if (!seg) return null;
+                                    const isHovered = hoveredSegmentIndex === idx;
+                                    const isCompleted = item.status === "completed";
+                                    const isGenerating = item.status === "generating";
+                                    const isFailed = item.status === "failed";
+
+                                    const startPct = (seg.startTime / totalDuration) * 100;
+                                    const widthPct = (seg.duration / totalDuration) * 100;
+
+                                    return (
+                                      <div
+                                        key={item.id}
+                                        onMouseEnter={() => setHoveredSegmentIndex(idx)}
+                                        onMouseLeave={() => setHoveredSegmentIndex(null)}
+                                        className={`relative h-6 flex items-center transition-all bg-[#121419]/20 rounded border ${
+                                          isHovered ? "border-[#2D3036] bg-[#1F2937]/10" : "border-transparent"
+                                        }`}
+                                      >
+                                        {/* Guide line across timeline row */}
+                                        <div className="absolute left-0 right-0 h-[1px] bg-[#1F2937]/10 pointer-events-none" />
+
+                                        {/* Segment Block */}
+                                        <div
+                                          className={`absolute h-4.5 rounded flex items-center px-1 text-[8px] font-bold select-none cursor-pointer overflow-hidden transition-all duration-200 border ${
+                                            isHovered 
+                                              ? "shadow-[0_0_8px_rgba(74,222,128,0.25)] scale-[1.01] z-10" 
+                                              : ""
+                                          } ${
+                                            isCompleted
+                                              ? isHovered 
+                                                ? "bg-emerald-500/25 border-emerald-400 text-emerald-300"
+                                                : "bg-emerald-500/10 border-emerald-500/30 text-emerald-400"
+                                              : isGenerating
+                                                ? "bg-amber-500/15 border-amber-500/40 text-amber-500 animate-pulse"
+                                                : isFailed
+                                                  ? "bg-red-500/15 border-red-500/40 text-red-400"
+                                                  : "bg-[#1A1D24] border-[#2D3036]/80 text-[#8E9299]"
+                                          }`}
+                                          style={{
+                                            left: `${startPct}%`,
+                                            width: `${Math.max(6, widthPct)}%`,
+                                          }}
+                                          title={`Segment ${idx + 1}: ${item.voiceName} (${seg.duration.toFixed(1)}s)\nText: "${item.text}"`}
+                                          onClick={() => {
+                                            if (isCompleted) {
+                                              handlePlayBulkItem(item);
+                                            }
+                                          }}
+                                        >
+                                          <span className="truncate max-w-full">
+                                            [{idx + 1}] {item.voiceName} ({seg.duration.toFixed(1)}s)
+                                          </span>
+                                        </div>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+
+                                {/* Continuous track footer */}
+                                <div className="border-t border-[#2D3036]/40 pt-1.5 shrink-0">
+                                  <div className="text-[7.5px] text-[#5C616A] uppercase tracking-wider mb-1 font-bold flex justify-between">
+                                    <span>Linear Assembly Flow</span>
+                                    <span>{totalDuration.toFixed(1)}s total</span>
+                                  </div>
+                                  <div className="h-4.5 bg-[#121419] rounded border border-[#2D3036] flex overflow-hidden relative">
+                                    {bulkItems.map((item, idx) => {
+                                      const seg = timelineSegments[idx];
+                                      if (!seg) return null;
+                                      const isHovered = hoveredSegmentIndex === idx;
+                                      const isCompleted = item.status === "completed";
+                                      const widthPct = (seg.duration / totalDuration) * 100;
+
+                                      return (
+                                        <div
+                                          key={item.id}
+                                          onMouseEnter={() => setHoveredSegmentIndex(idx)}
+                                          onMouseLeave={() => setHoveredSegmentIndex(null)}
+                                          className={`h-full transition-all border-r border-[#0B0C0E]/40 last:border-r-0 cursor-pointer flex items-center justify-center text-[7px] font-bold ${
+                                            isHovered
+                                              ? "bg-[#4ADE80] text-[#0B0C0E] font-extrabold shadow-inner"
+                                              : isCompleted
+                                                ? "bg-emerald-500/20 text-emerald-400 hover:bg-emerald-500/30"
+                                                : item.status === "generating"
+                                                  ? "bg-amber-500/20 text-amber-500 animate-pulse"
+                                                  : item.status === "failed"
+                                                    ? "bg-red-500/20 text-red-400"
+                                                    : "bg-[#1C1F26] text-[#5C616A] hover:bg-[#2C313C]"
+                                          }`}
+                                          style={{ width: `${widthPct}%` }}
+                                          title={`Segment ${idx + 1} (${seg.duration.toFixed(1)}s)`}
+                                          onClick={() => {
+                                            if (isCompleted) {
+                                              handlePlayBulkItem(item);
+                                            }
+                                          }}
+                                        >
+                                          <span className="truncate px-0.5">
+                                            {idx + 1}
+                                          </span>
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                </div>
+                              </div>
+                            );
+                          })()}
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="max-h-[220px] overflow-y-auto divide-y divide-[#2D3036]/60 text-xs font-mono">
                     {bulkItems.length === 0 ? (
                       <div className="p-6 text-center text-[#5C616A] uppercase tracking-wide text-[9.5px]">
                         Queue is completely empty. Load presets or type above.
                       </div>
-                    ) : (
-                      bulkItems.map((item, idx) => {
-                        const isCurrent = isGeneratingBulk && bulkProgressIndex === idx;
+                    ) : (() => {
+                      const filtered = bulkItems.map((item, idx) => ({ item, originalIdx: idx }))
+                        .filter(({ item }) => {
+                          if (bulkFilter === "all") return true;
+                          return item.status === bulkFilter;
+                        });
+
+                      if (filtered.length === 0) {
+                        return (
+                          <div className="p-8 text-center text-[#5C616A] uppercase tracking-wide text-[9px]">
+                            No scripts in queue match the "{bulkFilter}" filter
+                          </div>
+                        );
+                      }
+
+                      return filtered.map(({ item, originalIdx }) => {
+                        const isCurrent = isGeneratingBulk && bulkProgressIndex === originalIdx;
+                        const isEditing = editingBulkItemId === item.id;
+
+                        if (isEditing) {
+                          return (
+                            <div 
+                              key={item.id} 
+                              className="p-3.5 bg-blue-950/20 border-l-2 border-blue-500 space-y-3 font-mono text-xs transition-colors"
+                            >
+                              <div className="flex items-center justify-between text-[9px] text-[#8E9299] uppercase font-bold">
+                                <span>Editing Item [{String(originalIdx + 1).padStart(2, "0")}]</span>
+                                <span className="text-blue-400 font-bold">Inline Editor</span>
+                              </div>
+                              <div className="space-y-1.5">
+                                <label className="text-[8px] text-[#5C616A] uppercase font-bold block">Script Text</label>
+                                <textarea
+                                  value={editingBulkText}
+                                  onChange={(e) => setEditingBulkText(e.target.value)}
+                                  className="w-full bg-[#0B0C0E] border border-[#2D3036] rounded p-2 text-xs font-sans text-white focus:outline-none focus:border-blue-500/60 leading-relaxed resize-y h-16"
+                                />
+                              </div>
+                              <div className="grid grid-cols-2 gap-2">
+                                <div className="space-y-1">
+                                  <label className="text-[8px] text-[#5C616A] uppercase font-bold block">Voice Model</label>
+                                  <select
+                                    value={editingBulkVoice}
+                                    onChange={(e) => setEditingBulkVoice(e.target.value)}
+                                    className="w-full bg-[#0B0C0E] border border-[#2D3036] rounded p-1.5 text-[10px] text-slate-300 font-mono focus:outline-none focus:border-blue-500/60 cursor-pointer"
+                                  >
+                                    {VOICES.map(v => (
+                                      <option key={v.name} value={v.name}>{v.name}</option>
+                                    ))}
+                                  </select>
+                                </div>
+                                <div className="space-y-1">
+                                  <label className="text-[8px] text-[#5C616A] uppercase font-bold block">Tone Description</label>
+                                  <input
+                                    type="text"
+                                    value={editingBulkTone}
+                                    onChange={(e) => setEditingBulkTone(e.target.value)}
+                                    className="w-full bg-[#0B0C0E] border border-[#2D3036] rounded p-1.5 text-[10px] text-slate-300 font-mono focus:outline-none focus:border-blue-500/60"
+                                  />
+                                </div>
+                              </div>
+                              <div className="flex items-center justify-end gap-1.5 pt-1">
+                                <button
+                                  type="button"
+                                  onClick={() => setEditingBulkItemId(null)}
+                                  className="px-2.5 py-1 bg-neutral-800 hover:bg-neutral-700 text-[#8E9299] text-[9px] rounded font-bold uppercase transition-all cursor-pointer"
+                                >
+                                  Cancel
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const didChange = item.text !== editingBulkText || item.voiceName !== editingBulkVoice || item.toneDescription !== editingBulkTone;
+                                    updateBulkItemsWithUndo(prev => prev.map(p => p.id === item.id ? {
+                                      ...p,
+                                      text: editingBulkText,
+                                      voiceName: editingBulkVoice,
+                                      toneDescription: editingBulkTone,
+                                      status: didChange ? "idle" : p.status,
+                                      base64Audio: didChange ? undefined : p.base64Audio,
+                                      audioBuffer: didChange ? undefined : p.audioBuffer,
+                                      duration: didChange ? undefined : p.duration,
+                                    } : p));
+                                    setEditingBulkItemId(null);
+                                  }}
+                                  className="px-3 py-1 bg-blue-600 hover:bg-blue-500 text-white text-[9px] rounded font-bold uppercase transition-all cursor-pointer"
+                                >
+                                  Save Change
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        }
+
                         return (
                           <div 
                             key={item.id} 
@@ -3869,7 +4974,7 @@ export default function App() {
                             <div className="space-y-1.5 flex-grow">
                               <div className="flex items-center gap-2 flex-wrap">
                                 <span className="text-[9.5px] text-[#5C616A] font-bold">
-                                  [{String(idx + 1).padStart(2, "0")}]
+                                  [{String(originalIdx + 1).padStart(2, "0")}]
                                 </span>
                                 <span className="text-white font-sans text-xs font-medium line-clamp-1 flex-grow pr-4">
                                   {item.text}
@@ -3895,9 +5000,11 @@ export default function App() {
                                   </span>
                                 )}
                                 {item.status === "generating" && (
-                                  <span className="text-[#4ADE80] flex items-center gap-1 animate-pulse">
-                                    <RefreshCw className="h-3 w-3 animate-spin animate-duration-1000" />
-                                    Synthesizing...
+                                  <span className="text-[#4ADE80] flex items-center gap-1.5 animate-pulse bg-emerald-500/10 border border-emerald-500/20 px-1.5 py-0.5 rounded">
+                                    <RefreshCw className="h-3 w-3 animate-spin" />
+                                    <span className="truncate max-w-[120px]" title={item.progressText || "Synthesizing..."}>
+                                      {item.progressText || "Synthesizing..."}
+                                    </span>
                                   </span>
                                 )}
                                 {item.status === "completed" && (
@@ -3907,9 +5014,11 @@ export default function App() {
                                   </span>
                                 )}
                                 {item.status === "failed" && (
-                                  <span className="text-[#FF4444] flex items-center gap-1 bg-red-500/10 border border-red-500/20 px-1.5 py-0.5 rounded" title={item.error}>
-                                    <AlertCircle className="h-3 w-3" />
-                                    Fail
+                                  <span className="text-[#FF4444] flex items-center gap-1.5 bg-red-500/10 border border-red-500/20 px-1.5 py-0.5 rounded" title={item.error}>
+                                    <AlertCircle className="h-3 w-3 shrink-0" />
+                                    <span className="truncate max-w-[150px]" title={item.error}>
+                                      {item.progressText || "Fail"}
+                                    </span>
                                   </span>
                                 )}
                               </div>
@@ -3917,6 +5026,9 @@ export default function App() {
                               <div className="flex items-center gap-1.5">
                                 {item.status === "completed" && (
                                   <>
+                                    <div className="mr-1" title="Synthesized audio waveform signature">
+                                      <BulkItemWaveform buffer={item.audioBuffer} />
+                                    </div>
                                     <button
                                       onClick={() => handlePlayBulkItem(item)}
                                       className="p-1.5 bg-[#4ADE80]/10 hover:bg-[#4ADE80]/20 text-[#4ADE80] border border-[#4ADE80]/20 hover:border-[#4ADE80]/40 rounded transition-colors cursor-pointer"
@@ -3934,8 +5046,20 @@ export default function App() {
                                   </>
                                 )}
                                 <button
-                                  onClick={() => setBulkItems(prev => prev.filter(p => p.id !== item.id))}
-                                  className="p-1.5 hover:bg-[#FF4444]/10 text-[#5C616A] hover:text-[#FF4444] rounded transition-colors cursor-pointer"
+                                  onClick={() => {
+                                    setEditingBulkItemId(item.id);
+                                    setEditingBulkText(item.text);
+                                    setEditingBulkVoice(item.voiceName);
+                                    setEditingBulkTone(item.toneDescription);
+                                  }}
+                                  className="p-1.5 hover:bg-blue-500/10 text-[#5C616A] hover:text-blue-400 border border-transparent hover:border-blue-500/20 rounded transition-colors cursor-pointer"
+                                  title="Edit script / settings"
+                                >
+                                  <Pencil className="h-3.5 w-3.5" />
+                                </button>
+                                <button
+                                  onClick={() => updateBulkItemsWithUndo(prev => prev.filter(p => p.id !== item.id))}
+                                  className="p-1.5 hover:bg-[#FF4444]/10 text-[#5C616A] hover:text-[#FF4444] border border-transparent hover:border-[#FF4444]/20 rounded transition-colors cursor-pointer"
                                   title="Remove from batch"
                                 >
                                   <Trash2 className="h-3.5 w-3.5" />
@@ -3944,61 +5068,62 @@ export default function App() {
                             </div>
                           </div>
                         );
-                      })
-                    )}
+                      });
+                    })()}
                   </div>
-                </div>
+                )}
+              </div>
 
-                {/* Bulk Actions Console Controls */}
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-2 border-t border-[#2D3036]/60 font-mono">
-                  <button
-                    onClick={handleGenerateBulkBatch}
-                    disabled={isGeneratingBulk || bulkItems.length === 0}
-                    className={`col-span-1 sm:col-span-1 py-3 px-4 rounded text-xs font-mono font-bold tracking-widest uppercase transition-all flex items-center justify-center gap-2 border cursor-pointer ${
-                      isGeneratingBulk || bulkItems.length === 0
-                        ? "bg-[#15171C] border-[#2D3036] text-[#5C616A]"
-                        : "bg-[#4ADE80] hover:bg-[#22C55E] border-none text-[#0B0C0E] hover:scale-[1.01] hover:shadow-[0_0_12px_rgba(74,222,128,0.3)] active:scale-[0.99]"
-                    }`}
-                  >
-                    {isGeneratingBulk ? (
-                      <>
-                        <RefreshCw className="h-3.5 w-3.5 animate-spin animate-duration-1000" />
-                        <span>Generating [{bulkProgressIndex + 1}/{bulkItems.length}]</span>
-                      </>
-                    ) : (
-                      <>
-                        <Sparkles className="h-3.5 w-3.5" />
-                        <span>Process Batch</span>
-                      </>
-                    )}
-                  </button>
+              {/* Bulk Actions Console Controls */}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-2 border-t border-[#2D3036]/60 font-mono">
+                <button
+                  onClick={handleGenerateBulkBatch}
+                  disabled={isGeneratingBulk || bulkItems.length === 0}
+                  className={`col-span-1 sm:col-span-1 py-3 px-4 rounded text-xs font-mono font-bold tracking-widest uppercase transition-all flex items-center justify-center gap-2 border cursor-pointer ${
+                    isGeneratingBulk || bulkItems.length === 0
+                      ? "bg-[#15171C] border-[#2D3036] text-[#5C616A]"
+                      : "bg-[#4ADE80] hover:bg-[#22C55E] border-none text-[#0B0C0E] hover:scale-[1.01] hover:shadow-[0_0_12px_rgba(74,222,128,0.3)] active:scale-[0.99]"
+                  }`}
+                >
+                  {isGeneratingBulk ? (
+                    <>
+                      <RefreshCw className="h-3.5 w-3.5 animate-spin animate-duration-1000" />
+                      <span>Generating [{bulkProgressIndex + 1}/{bulkItems.length}]</span>
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="h-3.5 w-3.5" />
+                      <span>Process Batch</span>
+                    </>
+                  )}
+                </button>
 
-                  <button
-                    onClick={handleDownloadAllAsZip}
-                    disabled={isGeneratingBulk || !bulkItems.some(i => i.status === "completed")}
-                    className={`py-3 px-4 rounded text-xs font-mono font-bold tracking-widest uppercase transition-all flex items-center justify-center gap-2 border cursor-pointer ${
-                      isGeneratingBulk || !bulkItems.some(i => i.status === "completed")
-                        ? "bg-[#15171C] border-[#2D3036] text-[#5C616A]"
-                        : "bg-purple-600 hover:bg-purple-500 border-none text-white hover:scale-[1.01] hover:shadow-[0_0_12px_rgba(147,51,234,0.3)] active:scale-[0.99]"
-                    }`}
-                  >
-                    <DownloadCloud className="h-3.5 w-3.5" />
-                    <span>Zip Export</span>
-                  </button>
+                <button
+                  onClick={handleDownloadAllAsZip}
+                  disabled={isGeneratingBulk || !bulkItems.some(i => i.status === "completed")}
+                  className={`py-3 px-4 rounded text-xs font-mono font-bold tracking-widest uppercase transition-all flex items-center justify-center gap-2 border cursor-pointer ${
+                    isGeneratingBulk || !bulkItems.some(i => i.status === "completed")
+                      ? "bg-[#15171C] border-[#2D3036] text-[#5C616A]"
+                      : "bg-purple-600 hover:bg-purple-500 border-none text-white hover:scale-[1.01] hover:shadow-[0_0_12px_rgba(147,51,234,0.3)] active:scale-[0.99]"
+                  }`}
+                >
+                  <DownloadCloud className="h-3.5 w-3.5" />
+                  <span>Zip Export</span>
+                </button>
 
-                  <button
-                    onClick={() => {
-                      if (window.confirm("Are you sure you want to clear the batch queue? All cached states will be cleared.")) {
-                        setBulkItems([]);
-                        setBulkInputText("");
-                      }
-                    }}
-                    className="py-3 px-4 rounded text-xs font-mono font-bold tracking-widest uppercase transition-all flex items-center justify-center gap-2 border border-[#FF4444]/30 text-[#FF4444] hover:bg-[#FF4444]/15 active:scale-[0.99] cursor-pointer"
-                  >
-                    <Trash2 className="h-3.5 w-3.5" />
-                    <span>Reset</span>
-                  </button>
-                </div>
+                <button
+                  onClick={() => {
+                    if (window.confirm("Are you sure you want to clear the batch queue? All cached states will be cleared.")) {
+                      updateBulkItemsWithUndo([]);
+                      setBulkInputText("");
+                    }
+                  }}
+                  className="py-3 px-4 rounded text-xs font-mono font-bold tracking-widest uppercase transition-all flex items-center justify-center gap-2 border border-[#FF4444]/30 text-[#FF4444] hover:bg-[#FF4444]/15 active:scale-[0.99] cursor-pointer"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  <span>Reset</span>
+                </button>
+              </div>
               </div>
             )}
           </section>
@@ -4091,7 +5216,14 @@ export default function App() {
                 ref={canvasRef} 
                 width={600} 
                 height={60} 
-                className="w-full h-16 z-10 pointer-events-none"
+                className={`w-full h-16 z-10 select-none ${base64Audio ? "cursor-ew-resize" : "pointer-events-none"}`}
+                onMouseDown={handleCanvasMouseDown}
+                onMouseMove={handleCanvasMouseMove}
+                onMouseUp={handleCanvasMouseUpOrLeave}
+                onMouseLeave={handleCanvasMouseUpOrLeave}
+                onTouchStart={handleCanvasTouchStart}
+                onTouchMove={handleCanvasTouchMove}
+                onTouchEnd={handleCanvasMouseUpOrLeave}
               />
 
               <div className="flex items-center justify-between z-10 text-[9px] font-mono text-[#5C616A]">
@@ -4147,6 +5279,146 @@ export default function App() {
                   <span className="text-white min-w-[32px] text-right font-bold">{waveformPan}%</span>
                 </div>
               )}
+            </div>
+
+            {/* Precision Interactive Audio Trimming Console */}
+            {base64Audio && (
+              <div className="bg-[#121418] border border-[#2D3036] p-3.5 rounded space-y-3 font-mono text-[10px] z-10 select-none">
+                <div className="flex items-center justify-between text-[#8E9299] uppercase font-bold tracking-wider text-[9px] border-b border-[#2D3036]/50 pb-1.5">
+                  <span className="flex items-center gap-1.5">
+                    <span className="h-1.5 w-1.5 rounded-full bg-amber-500 animate-pulse" />
+                    Interactive Audio Trimmer
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => {
+                        setTrimStartRatio(0);
+                        setTrimEndRatio(1);
+                      }}
+                      className="text-[9px] text-[#8E9299] hover:text-[#4ADE80] border border-[#2D3036] hover:border-[#4ADE80]/30 px-1.5 py-0.5 rounded transition-all"
+                      title="Reset start and end trim boundaries to full length"
+                    >
+                      Reset Trim
+                    </button>
+                    <span className="text-[#4ADE80]">Direct-to-Export Slicing</span>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div className="space-y-1.5">
+                    <div className="flex justify-between items-center text-[9px]">
+                      <span className="text-[#8E9299] uppercase font-bold text-amber-500">Trim Start Marker:</span>
+                      <span className="text-amber-500 font-bold">
+                        {(trimStartRatio * audioDuration).toFixed(2)}s ({(trimStartRatio * 100).toFixed(0)}%)
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="range"
+                        min="0"
+                        max="1"
+                        step="0.005"
+                        value={trimStartRatio}
+                        onChange={(e) => {
+                          const val = parseFloat(e.target.value);
+                          setTrimStartRatio(Math.min(val, trimEndRatio - 0.02));
+                        }}
+                        className="flex-grow h-1 bg-[#1A1D24] rounded-lg appearance-none cursor-pointer accent-amber-500"
+                        title="Drag to trim silent or filler sections from the beginning"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <div className="flex justify-between items-center text-[9px]">
+                      <span className="text-[#8E9299] uppercase font-bold text-red-500">Trim End Marker:</span>
+                      <span className="text-red-500 font-bold">
+                        {(trimEndRatio * audioDuration).toFixed(2)}s ({(trimEndRatio * 100).toFixed(0)}%)
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="range"
+                        min="0"
+                        max="1"
+                        step="0.005"
+                        value={trimEndRatio}
+                        onChange={(e) => {
+                          const val = parseFloat(e.target.value);
+                          setTrimEndRatio(Math.max(val, trimStartRatio + 0.02));
+                        }}
+                        className="flex-grow h-1 bg-[#1A1D24] rounded-lg appearance-none cursor-pointer accent-red-500"
+                        title="Drag to trim trailing silent or filler sections from the end"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 text-[9px] text-[#8E9299] border-t border-[#2D3036]/50 pt-2 bg-[#0B0C0E]/30 p-2 rounded">
+                  <div className="flex items-center gap-1.5 col-span-2">
+                    <span className="text-[#5C616A]">Original:</span>
+                    <span className="text-white font-bold">{audioDuration.toFixed(2)}s</span>
+                    <span className="text-[#5C616A] ml-2">Active Playback/Export:</span>
+                    <span className="text-[#4ADE80] font-bold">
+                      {((trimEndRatio - trimStartRatio) * audioDuration).toFixed(2)}s
+                    </span>
+                  </div>
+                  <span className="text-[#5C616A] text-[8px] italic">
+                    💡 Drag orange and red vertical handles directly on the waveform to visual-trim!
+                  </span>
+                </div>
+              </div>
+            )}
+
+            {/* Visual Fade-In / Fade-Out Transient Settings */}
+            <div className="bg-[#121418] border border-[#2D3036] p-3.5 rounded space-y-3 font-mono text-[10px] z-10 select-none">
+              <div className="flex items-center justify-between text-[#8E9299] uppercase font-bold tracking-wider text-[9px] border-b border-[#2D3036]/50 pb-1.5">
+                <span className="flex items-center gap-1.5">
+                  <span className="h-1.5 w-1.5 rounded-full bg-blue-400 animate-pulse" />
+                  Transient Fade Envelopes
+                </span>
+                <span className="text-[#4ADE80]">Anti-Click / Pop Filter</span>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div className="space-y-1.5">
+                  <div className="flex justify-between items-center text-[9px]">
+                    <span className="text-[#8E9299] uppercase font-bold">Fade-In Duration:</span>
+                    <span className="text-blue-400 font-bold">{fadeInDuration.toFixed(2)}s</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="range"
+                      min="0.00"
+                      max="1.50"
+                      step="0.01"
+                      value={fadeInDuration}
+                      onChange={(e) => setFadeInDuration(parseFloat(e.target.value))}
+                      className="flex-grow h-1 bg-[#1A1D24] rounded-lg appearance-none cursor-pointer accent-blue-500"
+                      id="fade-in-slider"
+                      title="Adjust fade-in envelope length to avoid initial transient pop"
+                    />
+                  </div>
+                </div>
+                <div className="space-y-1.5">
+                  <div className="flex justify-between items-center text-[9px]">
+                    <span className="text-[#8E9299] uppercase font-bold">Fade-Out Duration:</span>
+                    <span className="text-blue-400 font-bold">{fadeOutDuration.toFixed(2)}s</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="range"
+                      min="0.00"
+                      max="1.50"
+                      step="0.01"
+                      value={fadeOutDuration}
+                      onChange={(e) => setFadeOutDuration(parseFloat(e.target.value))}
+                      className="flex-grow h-1 bg-[#1A1D24] rounded-lg appearance-none cursor-pointer accent-blue-500"
+                      id="fade-out-slider"
+                      title="Adjust fade-out envelope length to avoid trailing clicks"
+                    />
+                  </div>
+                </div>
+              </div>
             </div>
 
             {/* Errors block */}
@@ -4283,45 +5555,127 @@ export default function App() {
                 </div>
 
                 {/* Download and Export Buttons group */}
-                <div className="flex items-center gap-2 flex-wrap">
-                  {/* High Fidelity Download Master Trigger */}
-                  <button
-                    onClick={downloadWav}
-                    disabled={!base64Audio || isExportingMp3}
-                    className={`h-11 px-4 rounded text-xs font-mono font-bold tracking-widest uppercase flex items-center gap-2 transition-all ${
-                      !base64Audio
-                        ? "bg-[#15171C] border border-[#2D3036] text-[#5C616A] cursor-not-allowed"
-                        : "bg-[#15171C] hover:bg-[#1C1F26] text-white border border-[#2D3036] hover:border-[#5C616A] hover:scale-[1.02]"
-                    }`}
-                    id="btn-download-wav"
-                  >
-                    <Download className="h-4 w-4" />
-                    <span>DOWNLOAD WAV</span>
-                  </button>
+                <div className="flex flex-col gap-2.5 w-full">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {/* High Fidelity Download Master Trigger */}
+                    <button
+                      onClick={downloadWav}
+                      disabled={!base64Audio || isExportingMp3}
+                      className={`h-11 px-4 rounded text-xs font-mono font-bold tracking-widest uppercase flex items-center gap-2 transition-all ${
+                        !base64Audio
+                          ? "bg-[#15171C] border border-[#2D3036] text-[#5C616A] cursor-not-allowed"
+                          : "bg-[#15171C] hover:bg-[#1C1F26] text-white border border-[#2D3036] hover:border-[#5C616A] hover:scale-[1.02]"
+                      }`}
+                      id="btn-download-wav"
+                    >
+                      <Download className="h-4 w-4" />
+                      <span>DOWNLOAD WAV</span>
+                    </button>
 
-                  {/* Compressed Export MP3 Trigger */}
-                  <button
-                    onClick={exportCompressedMp3}
-                    disabled={!base64Audio || isExportingMp3}
-                    className={`h-11 px-4 rounded text-xs font-mono font-bold tracking-widest uppercase flex items-center gap-2 transition-all ${
-                      !base64Audio || isExportingMp3
-                        ? "bg-[#15171C] border border-[#2D3036] text-[#5C616A] cursor-not-allowed"
-                        : "bg-[#4ADE80] hover:bg-[#22C55E] text-[#0B0C0E] border-none hover:scale-[1.02] hover:shadow-[0_0_10px_rgba(74,222,128,0.3)] cursor-pointer"
-                    }`}
-                    id="btn-export-mp3"
-                  >
-                    {isExportingMp3 ? (
-                      <>
-                        <RefreshCw className="h-4 w-4 animate-spin" />
-                        <span>COMPRESSING...</span>
-                      </>
-                    ) : (
-                      <>
-                        <Sparkles className="h-4 w-4" />
-                        <span>EXPORT MP3 (192K)</span>
-                      </>
-                    )}
-                  </button>
+                    {/* Compressed Export MP3 Trigger */}
+                    <button
+                      onClick={exportCompressedMp3}
+                      disabled={!base64Audio || isExportingMp3}
+                      className={`h-11 px-4 rounded text-xs font-mono font-bold tracking-widest uppercase flex items-center gap-2 transition-all relative overflow-hidden ${
+                        !base64Audio
+                          ? "bg-[#15171C] border border-[#2D3036] text-[#5C616A] cursor-not-allowed"
+                          : isExportingMp3
+                            ? "bg-[#15171C] border border-emerald-500/40 text-emerald-400 cursor-wait"
+                            : "bg-[#4ADE80] hover:bg-[#22C55E] text-[#0B0C0E] border-none hover:scale-[1.02] hover:shadow-[0_0_10px_rgba(74,222,128,0.3)] cursor-pointer"
+                      }`}
+                      id="btn-export-mp3"
+                    >
+                      {isExportingMp3 && (
+                        <div 
+                          className="absolute inset-y-0 left-0 bg-emerald-500/10 transition-all duration-150 ease-out" 
+                          style={{ width: `${mp3ExportProgress}%` }}
+                        />
+                      )}
+                      
+                      <span className="relative z-10 flex items-center gap-2">
+                        {isExportingMp3 ? (
+                          <>
+                            <RefreshCw className="h-4 w-4 animate-spin" />
+                            <span>ENCODING {mp3ExportProgress}%</span>
+                          </>
+                        ) : (
+                          <>
+                            <Sparkles className="h-4 w-4" />
+                            <span>EXPORT MP3 (192K)</span>
+                          </>
+                        )}
+                      </span>
+                    </button>
+
+                    {/* Premium Audio Sharing Link Trigger */}
+                    <button
+                      onClick={handleShareAudio}
+                      disabled={!base64Audio || isSharing}
+                      className={`h-11 px-4 rounded text-xs font-mono font-bold tracking-widest uppercase flex items-center gap-2 transition-all ${
+                        !base64Audio || isSharing
+                          ? "bg-[#15171C] border border-[#2D3036] text-[#5C616A] cursor-not-allowed"
+                          : "bg-blue-600 hover:bg-blue-500 text-white border-none hover:scale-[1.02] hover:shadow-[0_0_10px_rgba(59,130,246,0.3)] cursor-pointer"
+                      }`}
+                      id="btn-share-audio"
+                      title="Generate a temporary shareable URL for this voiceover and copy it to clipboard"
+                    >
+                      {isSharing ? (
+                        <>
+                          <RefreshCw className="h-4 w-4 animate-spin" />
+                          <span>SHARING...</span>
+                        </>
+                      ) : copySuccess ? (
+                        <>
+                          <Check className="h-4 w-4 text-[#4ADE80]" />
+                          <span>LINK COPIED!</span>
+                        </>
+                      ) : (
+                        <>
+                          <Share2 className="h-4 w-4" />
+                          <span>SHARE LINK</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+
+                  {shareError && (
+                    <div className="text-[10px] text-rose-400 font-mono mt-1 flex items-center gap-1.5 bg-rose-950/20 border border-rose-500/20 p-2 rounded">
+                      <AlertCircle className="h-3.5 w-3.5 text-rose-500" />
+                      <span>Failed to create share link: {shareError}</span>
+                    </div>
+                  )}
+
+                  {shareUrl && (
+                    <div className="bg-[#0B0C0E]/90 border border-blue-500/30 rounded p-3 space-y-2 shadow-inner">
+                      <div className="flex items-center justify-between text-[9px] font-mono text-[#8E9299]">
+                        <span className="flex items-center gap-1">
+                          <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse" />
+                          TEMPORARY CLOUD AUDIO LINK (EXPIRES IN 24H)
+                        </span>
+                        <span className="text-blue-400 font-bold">READY</span>
+                      </div>
+                      <div className="flex gap-2 items-center">
+                        <input
+                          type="text"
+                          readOnly
+                          value={shareUrl}
+                          className="flex-1 bg-[#14161B] border border-[#2D3036] text-[10px] font-mono text-slate-300 p-2 rounded select-all focus:outline-none"
+                          onClick={(e) => (e.target as HTMLInputElement).select()}
+                        />
+                        <button
+                          onClick={() => {
+                            navigator.clipboard.writeText(shareUrl);
+                            setCopySuccess(true);
+                            setTimeout(() => setCopySuccess(false), 3000);
+                          }}
+                          className="bg-blue-600/20 hover:bg-blue-600/40 border border-blue-500/30 text-blue-300 hover:text-white h-8 px-3 text-[10px] font-mono font-bold rounded transition-all cursor-pointer flex items-center gap-1"
+                        >
+                          <Link className="h-3 w-3" />
+                          COPY
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
 
               </div>
@@ -4397,10 +5751,8 @@ export default function App() {
             : "NONE"
           }
         </div>
-        <div className="flex gap-8">
-          <span>DEDICATED CORE: 08</span>
-          <span>TEMP: 42°C</span>
-          <span>ENCRYPTION: AES-256</span>
+        <div className="text-slate-300 font-sans font-medium text-xs flex items-center gap-1">
+          Made with ❤️ by Alex
         </div>
         <div>SYS_VER: 4.12.0_DRY</div>
       </footer>

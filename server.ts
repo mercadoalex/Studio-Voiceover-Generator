@@ -68,6 +68,77 @@ app.post("/api/generate-tts", async (req, res) => {
   }
 });
 
+// In-Memory storage for temporary shareable links
+interface SharedAudioEntry {
+  base64Audio: string;
+  text: string;
+  voiceName: string;
+  createdAt: number;
+}
+const sharedAudios = new Map<string, SharedAudioEntry>();
+
+// Keep storage bounded and clean up old links periodically (older than 24 hours)
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, val] of sharedAudios.entries()) {
+    if (now - val.createdAt > 24 * 60 * 60 * 1000) {
+      sharedAudios.delete(key);
+    }
+  }
+}, 60 * 60 * 1000); // Check once per hour
+
+// Create a shareable audio record
+app.post("/api/share", (req, res) => {
+  try {
+    const { base64Audio, text, voiceName } = req.body;
+    if (!base64Audio) {
+      return res.status(400).json({ error: "No audio data to share." });
+    }
+
+    // Limit maximum size of the map to prevent memory leak issues (max 100 entries)
+    if (sharedAudios.size >= 100) {
+      let oldestKey: string | null = null;
+      let oldestTime = Infinity;
+      for (const [key, val] of sharedAudios.entries()) {
+        if (val.createdAt < oldestTime) {
+          oldestTime = val.createdAt;
+          oldestKey = key;
+        }
+      }
+      if (oldestKey) {
+        sharedAudios.delete(oldestKey);
+      }
+    }
+
+    // Generate standard robust clean alpha-numeric ID
+    const id = Math.random().toString(36).substring(2, 10);
+    sharedAudios.set(id, {
+      base64Audio,
+      text: text || "",
+      voiceName: voiceName || "Charon",
+      createdAt: Date.now(),
+    });
+
+    res.json({ id });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to create share link." });
+  }
+});
+
+// Retrieve a shareable audio record
+app.get("/api/share/:id", (req, res) => {
+  try {
+    const { id } = req.params;
+    const entry = sharedAudios.get(id);
+    if (!entry) {
+      return res.status(404).json({ error: "Shareable link has expired or was not found." });
+    }
+    res.json(entry);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to fetch shared voiceover." });
+  }
+});
+
 // Setup Vite Dev Server / Static Hosting
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
