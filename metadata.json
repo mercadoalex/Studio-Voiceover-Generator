@@ -1,0 +1,6 @@
+{
+  "name": "Studio Voiceover Generator",
+  "description": "A professional dry recording studio text-to-speech generator featuring voice selection, tone customization, and premium audio visualization.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
